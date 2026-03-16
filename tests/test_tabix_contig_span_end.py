@@ -65,7 +65,9 @@ def test_build_shard_ranges_uses_tabix_when_contig_length_missing(tmp_path, monk
     def _boom(*_args, **_kwargs):
         raise RuntimeError("should not scan contig bounds when tabix index is available")
 
-    monkeypatch.setattr(ingest_mod, "_infer_contig_bounds_from_records", _boom)
+    from hapstore._internal import _ingest_sharding as sharding_mod
+
+    monkeypatch.setattr(sharding_mod, "_infer_contig_bounds_from_records", _boom)
 
     import pysam
 

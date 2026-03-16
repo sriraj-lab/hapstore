@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -10,8 +9,10 @@ import numpy as np
 import zarr
 from numcodecs import VLenUTF8, Zstd
 
-from hapstore._internal.chrom import normalize_chrom
+from hapstore.chrom import normalize_chrom
 
+from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.zarr_utils import _create_utf8_array, _to_unicode_array
 from .windows import compute_window_boundaries, compute_window_midpoints
 
 _MISSING_SENTINEL = 255
@@ -276,27 +277,21 @@ class HapStore:
         build = attrs_payload.pop("build", None)
         layout_version = 1 if hap_chunk == n_haplotypes and sample_chunk_geno == n_samples else 2
         chrom_group.attrs.update(
-            {
-                "n_samples": n_samples,
-                "n_haplotypes": int(haps_u8.shape[0]),
-                "n_variants": n_variants,
-                "phased": True,
-                "ploidy": 2,
-                "missing_sentinel": _MISSING_SENTINEL,
-                "has_missing": has_missing,
-                "compression": "zstd",
-                "compression_level": int(compression_level),
-                "chunk_variant_size": int(chunk_variant_size),
-                "chunk_haplotype_size": None
-                if chunk_haplotype_size is None
-                else int(chunk_haplotype_size),
-                "chunk_sample_size": None if chunk_sample_size is None else int(chunk_sample_size),
-                "layout_version": int(layout_version),
-                "source": source,
-                "build": build,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "extra": attrs_payload or None,
-            }
+            build_chrom_attrs(
+                n_samples=n_samples,
+                n_haplotypes=int(haps_u8.shape[0]),
+                n_variants=n_variants,
+                missing_sentinel=_MISSING_SENTINEL,
+                has_missing=has_missing,
+                compression_level=int(compression_level),
+                chunk_variant_size=int(chunk_variant_size),
+                chunk_haplotype_size=chunk_haplotype_size,
+                chunk_sample_size=chunk_sample_size,
+                layout_version=int(layout_version),
+                source=source,
+                build=build,
+                extra=attrs_payload or None,
+            )
         )
 
     def delete_chromosome(self, chrom: str | int) -> None:
@@ -550,16 +545,6 @@ def _validate_sample_mask(sample_mask: np.ndarray, n_samples: int) -> np.ndarray
     return mask
 
 
-def _to_unicode_array(values: np.ndarray) -> np.ndarray:
-    out = np.empty(values.shape[0], dtype=object)
-    for i, value in enumerate(values):
-        if isinstance(value, bytes):
-            out[i] = value.decode("utf-8")
-        else:
-            out[i] = str(value)
-    return out
-
-
 def _normalize_optional_str_array(
     values: list[str] | np.ndarray | None,
     expected_len: int,
@@ -574,24 +559,6 @@ def _normalize_optional_str_array(
             f"{name} must be shape ({expected_len},), got shape={arr.shape}"
         )
     return arr
-
-
-def _create_utf8_array(
-    group: zarr.Group,
-    name: str,
-    values: np.ndarray,
-    chunk_size: int,
-    compressor: Zstd,
-) -> None:
-    group.create_dataset(
-        name,
-        data=np.asarray(values, dtype=object),
-        dtype=object,
-        object_codec=VLenUTF8(),
-        chunks=(int(max(1, chunk_size)),),
-        compressor=compressor,
-        overwrite=False,
-    )
 
 
 def _haplotypes_to_genotypes(haplotypes: np.ndarray) -> np.ndarray:

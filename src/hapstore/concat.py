@@ -4,46 +4,280 @@ from __future__ import annotations
 
 import gc
 import logging
-import multiprocessing as mp
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import numpy as np
-from numcodecs import Zstd
+import zarr
+from numcodecs import VLenUTF8, Zstd
 
-from hapstore._internal.seeding import stable_seed
-from hapstore._internal.chrom import normalize_chrom
+from hapstore.chrom import normalize_chrom
+from hapstore.seeding import stable_seed
 
-from .merge import (
-    _InputChrom,
-    _MISSING_SENTINEL,
-    _create_utf8_array,
-    _create_utf8_array_empty,
-    _find_duplicate_values,
-    _merge_populations_or_none,
-    _validate_and_collect_inputs,
-    _validate_variant_axis_streaming,
-    _write_variant_axis_from_reference,
+from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.concat_copy import (
+    _build_sample_axis_plans,
+    _build_variant_axis_plans,
+    _copy_dense_matrices,
 )
-from .store import HapStore, _haplotypes_to_genotypes
+from ._internal.zarr_utils import _create_utf8_array, _to_unicode_array
+from .store import HapStore
+
+
+_MISSING_SENTINEL = 255
+
+
+@dataclass
+class _InputChrom:
+    path: Path
+    store: HapStore
+    chrom_key: str
+    n_samples: int
+    n_haplotypes: int
+    n_variants: int
+    sample_ids: np.ndarray
+    populations: np.ndarray | None
+    haplotypes_arr: zarr.Array
+    variants_group: zarr.Group
+    has_missing: bool
+
+
+def _validate_and_collect_inputs(
+    input_stores: Sequence[str | Path | HapStore],
+    chrom_key: str,
+) -> list[_InputChrom]:
+    collected: list[_InputChrom] = []
+
+    for item in input_stores:
+        store = item if isinstance(item, HapStore) else HapStore(item, mode="r")
+        if not store.has_chromosome(chrom_key):
+            raise KeyError(
+                f"input store {store.path} does not contain chromosome {chrom_key!r}; "
+                "use has_chromosome() before concatenating"
+            )
+
+        chrom_group = store.root[chrom_key]
+        for required_name in ("haplotypes", "variants", "samples"):
+            if required_name not in chrom_group:
+                raise KeyError(
+                    f"input store {store.path} chromosome {chrom_key!r} missing {required_name!r}"
+                )
+
+        variants_group = chrom_group["variants"]
+        for field in ("pos", "ref", "alt", "vid"):
+            if field not in variants_group:
+                raise KeyError(
+                    f"input store {store.path} chromosome {chrom_key!r} missing variants/{field!r} dataset"
+                )
+
+        haplotypes_arr = chrom_group["haplotypes"]
+        sample_ids = _to_unicode_array(np.asarray(store.sample_ids(chrom_key), dtype=object))
+        n_samples = int(store.n_samples(chrom_key))
+        if sample_ids.shape[0] != n_samples:
+            raise ValueError(
+                f"input store {store.path} chromosome {chrom_key!r} sample ID count mismatch: "
+                f"n_samples={n_samples}, len(sample_ids)={sample_ids.shape[0]}"
+            )
+        n_haplotypes = int(haplotypes_arr.shape[0])
+        if n_haplotypes != (2 * n_samples):
+            raise ValueError(
+                f"input store {store.path} chromosome {chrom_key!r} has n_haplotypes={n_haplotypes} "
+                f"but expected {2 * n_samples} from n_samples={n_samples}"
+            )
+
+        populations = None
+        samples_group = chrom_group["samples"]
+        if "population" in samples_group:
+            populations = _to_unicode_array(np.asarray(samples_group["population"][:], dtype=object))
+
+        collected.append(
+            _InputChrom(
+                path=store.path,
+                store=store,
+                chrom_key=chrom_key,
+                n_samples=n_samples,
+                n_haplotypes=n_haplotypes,
+                n_variants=int(haplotypes_arr.shape[1]),
+                sample_ids=sample_ids,
+                populations=populations,
+                haplotypes_arr=haplotypes_arr,
+                variants_group=variants_group,
+                has_missing=bool(store.attrs(chrom_key).get("has_missing", False)),
+            )
+        )
+
+    return collected
+
+
+def _validate_variant_axis_streaming(
+    *,
+    sources: Sequence[_InputChrom],
+    variant_chunk: int,
+) -> None:
+    reference = sources[0]
+    for idx, src in enumerate(sources[1:], start=1):
+        if src.n_variants != reference.n_variants:
+            raise ValueError(
+                "n_variants mismatch across input stores: "
+                f"reference({reference.path})={reference.n_variants}, "
+                f"store[{idx}]({src.path})={src.n_variants}"
+            )
+
+    ref_variants = reference.variants_group
+    ref_has_genetic = "genetic_pos" in ref_variants
+    ref_genetic = ref_variants["genetic_pos"] if ref_has_genetic else None
+
+    for idx, src in enumerate(sources[1:], start=1):
+        src_has_genetic = "genetic_pos" in src.variants_group
+        if ref_has_genetic != src_has_genetic:
+            raise ValueError(
+                "genetic position presence mismatch across input stores: "
+                f"reference_has_genetic={ref_has_genetic}, store[{idx}]_has_genetic={src_has_genetic}"
+            )
+
+    for start in range(0, reference.n_variants, variant_chunk):
+        end = min(start + variant_chunk, reference.n_variants)
+        ref_pos_chunk = np.asarray(ref_variants["pos"][start:end], dtype=np.int64)
+        ref_ref_chunk = _to_unicode_array(np.asarray(ref_variants["ref"][start:end], dtype=object))
+        ref_alt_chunk = _to_unicode_array(np.asarray(ref_variants["alt"][start:end], dtype=object))
+        ref_vid_chunk = _to_unicode_array(np.asarray(ref_variants["vid"][start:end], dtype=object))
+        ref_genetic_chunk = (
+            None if ref_genetic is None else np.asarray(ref_genetic[start:end], dtype=np.float64)
+        )
+
+        for idx, src in enumerate(sources[1:], start=1):
+            src_variants = src.variants_group
+            if not np.array_equal(np.asarray(src_variants["pos"][start:end], dtype=np.int64), ref_pos_chunk):
+                raise ValueError(
+                    "variant position mismatch across input stores: "
+                    f"reference={reference.path}, store[{idx}]={src.path}"
+                )
+            if not np.array_equal(
+                _to_unicode_array(np.asarray(src_variants["ref"][start:end], dtype=object)),
+                ref_ref_chunk,
+            ):
+                raise ValueError(
+                    "REF allele mismatch across input stores: "
+                    f"reference={reference.path}, store[{idx}]={src.path}"
+                )
+            if not np.array_equal(
+                _to_unicode_array(np.asarray(src_variants["alt"][start:end], dtype=object)),
+                ref_alt_chunk,
+            ):
+                raise ValueError(
+                    "ALT allele mismatch across input stores: "
+                    f"reference={reference.path}, store[{idx}]={src.path}"
+                )
+            if not np.array_equal(
+                _to_unicode_array(np.asarray(src_variants["vid"][start:end], dtype=object)),
+                ref_vid_chunk,
+            ):
+                raise ValueError(
+                    "variant ID mismatch across input stores: "
+                    f"reference={reference.path}, store[{idx}]={src.path}"
+                )
+            if ref_genetic_chunk is not None and not np.array_equal(
+                np.asarray(src_variants["genetic_pos"][start:end], dtype=np.float64),
+                ref_genetic_chunk,
+            ):
+                raise ValueError(
+                    "genetic position values mismatch across input stores: "
+                    f"reference={reference.path}, store[{idx}]={src.path}"
+                )
+
+
+def _write_variant_axis_from_reference(
+    *,
+    variant_group: zarr.Group,
+    reference: _InputChrom,
+    n_variants: int,
+    variant_chunk: int,
+    compressor: Zstd,
+) -> None:
+    ref_variants = reference.variants_group
+    variant_group.create_dataset(
+        "pos",
+        shape=(n_variants,),
+        dtype=np.int64,
+        chunks=(variant_chunk,),
+        compressor=compressor,
+        overwrite=False,
+    )
+    ref_out = _create_utf8_array_empty(variant_group, "ref", n_variants, variant_chunk, compressor)
+    alt_out = _create_utf8_array_empty(variant_group, "alt", n_variants, variant_chunk, compressor)
+    vid_out = _create_utf8_array_empty(variant_group, "vid", n_variants, variant_chunk, compressor)
+    genetic_out = None
+    if "genetic_pos" in ref_variants:
+        genetic_out = variant_group.create_dataset(
+            "genetic_pos",
+            shape=(n_variants,),
+            dtype=np.float64,
+            chunks=(variant_chunk,),
+            compressor=compressor,
+            overwrite=False,
+        )
+
+    pos_out = variant_group["pos"]
+    for start in range(0, n_variants, variant_chunk):
+        end = min(start + variant_chunk, n_variants)
+        pos_out[start:end] = np.asarray(ref_variants["pos"][start:end], dtype=np.int64)
+        ref_out[start:end] = _to_unicode_array(np.asarray(ref_variants["ref"][start:end], dtype=object))
+        alt_out[start:end] = _to_unicode_array(np.asarray(ref_variants["alt"][start:end], dtype=object))
+        vid_out[start:end] = _to_unicode_array(np.asarray(ref_variants["vid"][start:end], dtype=object))
+        if genetic_out is not None:
+            genetic_out[start:end] = np.asarray(ref_variants["genetic_pos"][start:end], dtype=np.float64)
+
+
+def _merge_populations_or_none(sources: Sequence[_InputChrom]) -> np.ndarray | None:
+    first_has = sources[0].populations is not None
+    for idx, src in enumerate(sources[1:], start=1):
+        if (src.populations is not None) != first_has:
+            raise ValueError(
+                "population annotation presence mismatch across input stores: "
+                f"reference_has_population={first_has}, store[{idx}]_has_population={src.populations is not None}"
+            )
+
+    if not first_has:
+        return None
+    return np.concatenate([src.populations for src in sources if src.populations is not None], axis=0)
+
+
+def _find_duplicate_values(values: np.ndarray) -> list[str]:
+    seen: set[str] = set()
+    dup: list[str] = []
+    for value in values.tolist():
+        text = str(value)
+        if text in seen:
+            dup.append(text)
+            if len(dup) >= 10:
+                break
+        else:
+            seen.add(text)
+    return dup
+
+
+def _create_utf8_array_empty(
+    group: zarr.Group,
+    name: str,
+    length: int,
+    chunk_size: int,
+    compressor: Zstd,
+) -> zarr.Array:
+    return group.create_dataset(
+        name,
+        shape=(int(length),),
+        dtype=object,
+        object_codec=VLenUTF8(),
+        chunks=(int(max(1, chunk_size)),),
+        compressor=compressor,
+        overwrite=False,
+    )
 
 
 Axis = Literal["samples", "variants", 0, 1]
 ValidateMode = Literal["spot", "full", "none"]
-
-
-@dataclass(frozen=True)
-class _SourceWritePlan:
-    source_idx: int
-    source_path: Path
-    out_hap_offset: int
-    out_variant_offset: int
-    source_n_haps: int
-    source_n_vars: int
-
 
 @dataclass(frozen=True)
 class _ResolvedLayout:
@@ -385,25 +619,21 @@ def _concat_samples_into_store(
     build_attr = attrs_payload.pop("build", None)
     layout_version = 1 if hap_chunk == total_haps and sample_chunk_geno == total_samples else 2
     chrom_group.attrs.update(
-        {
-            "n_samples": int(total_samples),
-            "n_haplotypes": int(total_haps),
-            "n_variants": int(n_variants),
-            "phased": True,
-            "ploidy": 2,
-            "missing_sentinel": _MISSING_SENTINEL,
-            "has_missing": bool(has_missing),
-            "compression": "zstd",
-            "compression_level": int(resolved.compression_level),
-            "chunk_variant_size": int(variant_chunk),
-            "chunk_haplotype_size": resolved.chunk_haplotype_size_attr,
-            "chunk_sample_size": resolved.chunk_sample_size_attr,
-            "layout_version": int(layout_version),
-            "source": source_attr,
-            "build": build_attr,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "extra": attrs_payload or None,
-        }
+        build_chrom_attrs(
+            n_samples=int(total_samples),
+            n_haplotypes=int(total_haps),
+            n_variants=int(n_variants),
+            missing_sentinel=_MISSING_SENTINEL,
+            has_missing=bool(has_missing),
+            compression_level=int(resolved.compression_level),
+            chunk_variant_size=int(variant_chunk),
+            chunk_haplotype_size=resolved.chunk_haplotype_size_attr,
+            chunk_sample_size=resolved.chunk_sample_size_attr,
+            layout_version=int(layout_version),
+            source=source_attr,
+            build=build_attr,
+            extra=attrs_payload or None,
+        )
     )
 
 
@@ -567,391 +797,22 @@ def _concat_variants_into_store(
     build_attr = attrs_payload.pop("build", None)
     layout_version = 1 if hap_chunk == n_haps and sample_chunk_geno == n_samples else 2
     chrom_group.attrs.update(
-        {
-            "n_samples": int(n_samples),
-            "n_haplotypes": int(n_haps),
-            "n_variants": int(total_variants),
-            "phased": True,
-            "ploidy": 2,
-            "missing_sentinel": _MISSING_SENTINEL,
-            "has_missing": bool(has_missing),
-            "compression": "zstd",
-            "compression_level": int(resolved.compression_level),
-            "chunk_variant_size": int(variant_chunk),
-            "chunk_haplotype_size": resolved.chunk_haplotype_size_attr,
-            "chunk_sample_size": resolved.chunk_sample_size_attr,
-            "layout_version": int(layout_version),
-            "source": source_attr,
-            "build": build_attr,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "extra": attrs_payload or None,
-        }
-    )
-
-
-def _build_sample_axis_plans(sources: Sequence[_InputChrom]) -> list[_SourceWritePlan]:
-    plans: list[_SourceWritePlan] = []
-    hap_offset = 0
-    for i, src in enumerate(sources):
-        plans.append(
-            _SourceWritePlan(
-                source_idx=i,
-                source_path=src.path,
-                out_hap_offset=hap_offset,
-                out_variant_offset=0,
-                source_n_haps=int(src.n_haplotypes),
-                source_n_vars=int(src.n_variants),
-            )
+        build_chrom_attrs(
+            n_samples=int(n_samples),
+            n_haplotypes=int(n_haps),
+            n_variants=int(total_variants),
+            missing_sentinel=_MISSING_SENTINEL,
+            has_missing=bool(has_missing),
+            compression_level=int(resolved.compression_level),
+            chunk_variant_size=int(variant_chunk),
+            chunk_haplotype_size=resolved.chunk_haplotype_size_attr,
+            chunk_sample_size=resolved.chunk_sample_size_attr,
+            layout_version=int(layout_version),
+            source=source_attr,
+            build=build_attr,
+            extra=attrs_payload or None,
         )
-        hap_offset += src.n_haplotypes
-    return plans
-
-
-def _build_variant_axis_plans(sources: Sequence[_InputChrom]) -> list[_SourceWritePlan]:
-    plans: list[_SourceWritePlan] = []
-    v_offset = 0
-    for i, src in enumerate(sources):
-        plans.append(
-            _SourceWritePlan(
-                source_idx=i,
-                source_path=src.path,
-                out_hap_offset=0,
-                out_variant_offset=v_offset,
-                source_n_haps=int(src.n_haplotypes),
-                source_n_vars=int(src.n_variants),
-            )
-        )
-        v_offset += src.n_variants
-    return plans
-
-
-def _copy_dense_matrices(
-    *,
-    out_path: Path,
-    chrom_key: str,
-    axis: Literal["samples", "variants"],
-    plans: Sequence[_SourceWritePlan],
-    n_workers: int,
-    hap_chunk: int,
-    variant_chunk: int,
-    store_genotypes: bool,
-    sample_chunk_geno: int,
-    logger: logging.Logger,
-) -> None:
-    if n_workers <= 1:
-        for plan in plans:
-            _worker_copy_source(
-                source_path=plan.source_path,
-                out_path=out_path,
-                chrom_key=chrom_key,
-                axis=axis,
-                out_hap_offset=plan.out_hap_offset,
-                out_variant_offset=plan.out_variant_offset,
-                hap_chunk=hap_chunk,
-                variant_chunk=variant_chunk,
-                store_genotypes=store_genotypes,
-                sample_chunk_geno=sample_chunk_geno,
-                log_queue=None,
-            )
-        return
-
-    if axis == "samples":
-        total_haps = int(sum(p.source_n_haps for p in plans))
-        # Parallel-by-source is only safe/efficient when each source covers an integer
-        # number of output hap-chunks (so that no output chunk file is written by
-        # multiple sources).
-        chunk_disjoint = bool(all((int(p.source_n_haps) % int(hap_chunk)) == 0 for p in plans))
-        if not chunk_disjoint:
-            _copy_dense_matrices_parallel_by_output_hap_chunks(
-                out_path=out_path,
-                chrom_key=chrom_key,
-                plans=plans,
-                n_workers=n_workers,
-                hap_chunk=hap_chunk,
-                variant_chunk=variant_chunk,
-                total_haps=total_haps,
-                store_genotypes=store_genotypes,
-                sample_chunk_geno=sample_chunk_geno,
-                logger=logger,
-            )
-            return
-
-    ctx = mp.get_context("spawn")
-    manager = ctx.Manager()
-    queue = manager.Queue()
-    listener = _start_queue_listener(queue=queue)
-    try:
-        args = []
-        for plan in plans:
-            args.append(
-                dict(
-                    source_path=plan.source_path,
-                    out_path=out_path,
-                    chrom_key=chrom_key,
-                    axis=axis,
-                    out_hap_offset=plan.out_hap_offset,
-                    out_variant_offset=plan.out_variant_offset,
-                    hap_chunk=hap_chunk,
-                    variant_chunk=variant_chunk,
-                    store_genotypes=store_genotypes,
-                    sample_chunk_geno=sample_chunk_geno,
-                    log_queue=queue,
-                )
-            )
-        logger.info("COPY_START n_sources=%d n_workers=%d axis=%s", len(plans), n_workers, axis)
-        with ctx.Pool(processes=int(n_workers)) as pool:
-            pool.map(_worker_copy_source_star, args)
-        logger.info("COPY_DONE n_sources=%d axis=%s", len(plans), axis)
-    finally:
-        listener.stop()
-        manager.shutdown()
-
-
-@dataclass(frozen=True)
-class _OutputChunkTask:
-    out_h0: int
-    out_h1: int
-    overlaps: tuple[tuple[Path, int, int, int, int], ...]
-
-
-def _copy_dense_matrices_parallel_by_output_hap_chunks(
-    *,
-    out_path: Path,
-    chrom_key: str,
-    plans: Sequence[_SourceWritePlan],
-    n_workers: int,
-    hap_chunk: int,
-    variant_chunk: int,
-    total_haps: int,
-    store_genotypes: bool,
-    sample_chunk_geno: int,
-    logger: logging.Logger,
-) -> None:
-    del sample_chunk_geno
-    if total_haps <= 0:
-        raise ValueError("total_haps must be > 0")
-
-    tasks: list[_OutputChunkTask] = []
-    for out_h0 in range(0, int(total_haps), int(hap_chunk)):
-        out_h1 = min(int(out_h0) + int(hap_chunk), int(total_haps))
-        overlaps: list[tuple[Path, int, int, int, int]] = []
-        for p in plans:
-            src_global0 = int(p.out_hap_offset)
-            src_global1 = int(p.out_hap_offset) + int(p.source_n_haps)
-            if src_global1 <= int(out_h0) or src_global0 >= int(out_h1):
-                continue
-            ov0 = max(int(out_h0), src_global0)
-            ov1 = min(int(out_h1), src_global1)
-            out_local0 = ov0 - int(out_h0)
-            out_local1 = ov1 - int(out_h0)
-            src_local0 = ov0 - src_global0
-            src_local1 = ov1 - src_global0
-            overlaps.append((p.source_path, out_local0, out_local1, src_local0, src_local1))
-        if not overlaps:
-            raise AssertionError(f"no overlaps for output hap slice [{out_h0}, {out_h1})")
-        tasks.append(_OutputChunkTask(out_h0=int(out_h0), out_h1=int(out_h1), overlaps=tuple(overlaps)))
-
-    ctx = mp.get_context("spawn")
-    manager = ctx.Manager()
-    queue = manager.Queue()
-    listener = _start_queue_listener(queue=queue)
-    try:
-        args = []
-        for task in tasks:
-            args.append(
-                dict(
-                    out_path=out_path,
-                    chrom_key=chrom_key,
-                    out_h0=int(task.out_h0),
-                    out_h1=int(task.out_h1),
-                    overlaps=task.overlaps,
-                    variant_chunk=int(variant_chunk),
-                    log_queue=queue,
-                )
-            )
-        worker_count = min(int(n_workers), len(args))
-        logger.info(
-            "COPY_START n_output_hap_chunks=%d n_workers=%d axis=samples mode=output_hap_chunks",
-            len(args),
-            worker_count,
-        )
-        with ctx.Pool(processes=int(worker_count)) as pool:
-            pool.map(_worker_copy_output_hap_chunk_star, args)
-        logger.info("COPY_DONE n_output_hap_chunks=%d axis=samples mode=output_hap_chunks", len(args))
-    finally:
-        listener.stop()
-        manager.shutdown()
-
-
-def _worker_copy_output_hap_chunk_star(kwargs: dict) -> None:
-    _worker_copy_output_hap_chunk(**kwargs)
-
-
-def _worker_copy_output_hap_chunk(
-    *,
-    out_path: Path,
-    chrom_key: str,
-    out_h0: int,
-    out_h1: int,
-    overlaps: tuple[tuple[Path, int, int, int, int], ...],
-    variant_chunk: int,
-    log_queue,
-) -> None:
-    import logging.handlers
-
-    logger = logging.getLogger(__name__)
-    if log_queue is not None:
-        logger.handlers = []
-        logger.addHandler(logging.handlers.QueueHandler(log_queue))
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-
-    out = HapStore(out_path, mode="a")
-    out_group = out.root[chrom_key]
-    out_haps = out_group["haplotypes"]
-    n_vars = int(out_haps.shape[1])
-    block_haps = int(out_h1) - int(out_h0)
-
-    sources: dict[Path, HapStore] = {}
-    src_haps: dict[Path, Any] = {}
-    for src_path, _, _, _, _ in overlaps:
-        if src_path in sources:
-            continue
-        hs = HapStore(src_path, mode="r")
-        sources[src_path] = hs
-        src_haps[src_path] = hs.root[chrom_key]["haplotypes"]
-
-    logger.info(
-        "COPY_PROGRESS axis=samples mode=output_hap_chunks out_hap_offset=%d out_hap_end=%d n_sources=%d",
-        int(out_h0),
-        int(out_h1),
-        len(sources),
     )
-
-    for v0 in range(0, n_vars, int(variant_chunk)):
-        v1 = min(int(v0) + int(variant_chunk), n_vars)
-        block = np.empty((block_haps, int(v1) - int(v0)), dtype=np.uint8)
-        for src_path, out_local0, out_local1, src_local0, src_local1 in overlaps:
-            block[int(out_local0) : int(out_local1), :] = np.asarray(
-                src_haps[src_path][int(src_local0) : int(src_local1), int(v0) : int(v1)],
-                dtype=np.uint8,
-            )
-        out_haps[int(out_h0) : int(out_h1), int(v0) : int(v1)] = block
-
-        if "genotypes" in out_group:
-            if (int(out_h0) % 2) != 0 or (int(out_h1) % 2) != 0:
-                raise ValueError(
-                    "output hap slice must align to diploid sample boundaries when writing genotypes: "
-                    f"out_h0={out_h0}, out_h1={out_h1}"
-                )
-            sample0 = int(out_h0) // 2
-            sample1 = int(out_h1) // 2
-            out_group["genotypes"][sample0:sample1, int(v0) : int(v1)] = _haplotypes_to_genotypes(block)
-
-
-def _start_queue_listener(queue):
-    import logging.handlers
-    import sys
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(
-        logging.Formatter(fmt="%(asctime)s [%(levelname)s] pid=%(process)d %(name)s: %(message)s")
-    )
-    listener = logging.handlers.QueueListener(queue, handler, respect_handler_level=True)
-    listener.start()
-    return listener
-
-
-def _worker_copy_source_star(kwargs: dict) -> None:
-    _worker_copy_source(**kwargs)
-
-
-def _worker_copy_source(
-    *,
-    source_path: Path,
-    out_path: Path,
-    chrom_key: str,
-    axis: Literal["samples", "variants"],
-    out_hap_offset: int,
-    out_variant_offset: int,
-    hap_chunk: int,
-    variant_chunk: int,
-    store_genotypes: bool,
-    sample_chunk_geno: int,
-    log_queue,
-) -> None:
-    import logging.handlers
-
-    logger = logging.getLogger(__name__)
-    if log_queue is not None:
-        logger.handlers = []
-        logger.addHandler(logging.handlers.QueueHandler(log_queue))
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-
-    src = HapStore(source_path, mode="r")
-    out = HapStore(out_path, mode="a")
-    src_group = src.root[chrom_key]
-    out_group = out.root[chrom_key]
-    src_haps = src_group["haplotypes"]
-    out_haps = out_group["haplotypes"]
-
-    src_n_haps = int(src_haps.shape[0])
-    src_n_vars = int(src_haps.shape[1])
-
-    logger.info(
-        "COPY_PROGRESS source=%s axis=%s out_hap_offset=%d out_variant_offset=%d",
-        str(source_path),
-        axis,
-        int(out_hap_offset),
-        int(out_variant_offset),
-    )
-
-    if axis == "samples":
-        for h0 in range(0, src_n_haps, hap_chunk):
-            h1 = min(h0 + hap_chunk, src_n_haps)
-            out_h0 = out_hap_offset + h0
-            out_h1 = out_hap_offset + h1
-            for v0 in range(0, src_n_vars, variant_chunk):
-                v1 = min(v0 + variant_chunk, src_n_vars)
-                out_haps[out_h0:out_h1, v0:v1] = np.asarray(src_haps[h0:h1, v0:v1], dtype=np.uint8)
-
-            if store_genotypes:
-                geno_out = out_group["genotypes"]
-                sample0 = out_h0 // 2
-                sample1 = out_h1 // 2
-                for v0 in range(0, src_n_vars, variant_chunk):
-                    v1 = min(v0 + variant_chunk, src_n_vars)
-                    h_block = np.asarray(src_haps[h0:h1, v0:v1], dtype=np.uint8)
-                    geno_out[sample0:sample1, v0:v1] = _haplotypes_to_genotypes(h_block)
-
-    else:
-        out_var0 = int(out_variant_offset)
-        out_n_haps = int(out_haps.shape[0])
-        for h0 in range(0, out_n_haps, hap_chunk):
-            h1 = min(h0 + hap_chunk, out_n_haps)
-            for v0 in range(0, src_n_vars, variant_chunk):
-                v1 = min(v0 + variant_chunk, src_n_vars)
-                out_haps[h0:h1, out_var0 + v0 : out_var0 + v1] = np.asarray(
-                    src_haps[h0:h1, v0:v1],
-                    dtype=np.uint8,
-                )
-
-        if store_genotypes:
-            geno_out = out_group["genotypes"]
-            for s0 in range(0, int(geno_out.shape[0]), sample_chunk_geno):
-                s1 = min(s0 + sample_chunk_geno, int(geno_out.shape[0]))
-                h0 = 2 * s0
-                h1 = 2 * s1
-                for v0 in range(0, src_n_vars, variant_chunk):
-                    v1 = min(v0 + variant_chunk, src_n_vars)
-                    h_block = np.asarray(src_haps[h0:h1, v0:v1], dtype=np.uint8)
-                    geno_out[s0:s1, out_var0 + v0 : out_var0 + v1] = _haplotypes_to_genotypes(h_block)
-
-    logger.info("COPY_DONE source=%s axis=%s", str(source_path), axis)
-
-
 def _spot_validate_variant_axis(*, sources: Sequence[_InputChrom], variant_chunk: int) -> None:
     reference = sources[0]
     n_variants = int(reference.n_variants)

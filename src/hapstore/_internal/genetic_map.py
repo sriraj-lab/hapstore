@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .chrom import normalize_chrom
+from hapstore.chrom import normalize_chrom
 
 
 def _read_first_data_line(path: Path) -> str:

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
-from hapstore import HapStore, ingest_arrays, merge_chromosomes_sample_axis
+from hapstore import HapStore, concat_hapstores, ingest_arrays
 
 
 
@@ -34,26 +33,28 @@ def _split_fixture_arrays(synthetic_arrays: dict) -> tuple[dict, dict]:
 
 
 
-def test_merge_chromosomes_sample_axis_roundtrip(tmp_path, synthetic_arrays):
+def test_concat_hapstores_samples_roundtrip(tmp_path, synthetic_arrays):
     left, right = _split_fixture_arrays(synthetic_arrays)
 
     s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
     s2 = ingest_arrays(output_zarr=tmp_path / "right.zarr", chrom=21, **right)
 
     out_path = tmp_path / "merged.zarr"
-    with pytest.deprecated_call():
-        merge_chromosomes_sample_axis(
-            input_stores=[s1.path, s2.path],
-            output_store=out_path,
-            chrom="chr21",
-            output_mode="w",
-            chunk_variant_size=2,
-            chunk_haplotype_size=2,
-            chunk_sample_size=1,
-            compression_level=3,
-            store_genotypes=True,
-            attrs={"source": "merge_test"},
-        )
+    concat_hapstores(
+        input_stores=[s1.path, s2.path],
+        output_store=out_path,
+        chrom="chr21",
+        axis="samples",
+        validate="full",
+        n_workers=1,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        compression_level=3,
+        store_genotypes=True,
+        attrs={"source": "merge_test"},
+        overwrite=True,
+    )
 
     merged = HapStore(out_path, mode="r")
     assert merged.has_chromosome("chr21")
@@ -86,88 +87,7 @@ def test_merge_chromosomes_sample_axis_roundtrip(tmp_path, synthetic_arrays):
 
 
 
-def test_merge_chromosomes_sample_axis_variant_mismatch_raises(tmp_path, synthetic_arrays):
-    left, right = _split_fixture_arrays(synthetic_arrays)
-    right_bad_pos = np.asarray(right["variant_pos"], dtype=np.int64).copy()
-    right_bad_pos[2] += 1
-    right["variant_pos"] = right_bad_pos
-
-    s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
-    s2 = ingest_arrays(output_zarr=tmp_path / "right_bad.zarr", chrom="chr21", **right)
-
-    with pytest.raises(ValueError, match="variant position mismatch"):
-        with pytest.deprecated_call():
-            merge_chromosomes_sample_axis(
-                input_stores=[s1.path, s2.path],
-                output_store=tmp_path / "out.zarr",
-                chrom="chr21",
-            )
-
-
-
-def test_merge_chromosomes_sample_axis_missing_chrom_raises(tmp_path, synthetic_arrays):
-    left, right = _split_fixture_arrays(synthetic_arrays)
-
-    s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
-    s2 = ingest_arrays(output_zarr=tmp_path / "right.zarr", chrom="chr22", **right)
-
-    with pytest.raises(KeyError, match="does not contain chromosome"):
-        with pytest.deprecated_call():
-            merge_chromosomes_sample_axis(
-                input_stores=[s1.path, s2.path],
-                output_store=tmp_path / "out.zarr",
-                chrom="chr21",
-            )
-
-
-
-def test_merge_chromosomes_sample_axis_genetic_presence_mismatch_raises(tmp_path, synthetic_arrays):
-    left, right = _split_fixture_arrays(synthetic_arrays)
-    right["genetic_positions"] = None
-
-    s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
-    s2 = ingest_arrays(output_zarr=tmp_path / "right_no_genetic.zarr", chrom="chr21", **right)
-
-    with pytest.raises(ValueError, match="genetic position presence mismatch"):
-        with pytest.deprecated_call():
-            merge_chromosomes_sample_axis(
-                input_stores=[s1.path, s2.path],
-                output_store=tmp_path / "out.zarr",
-                chrom="chr21",
-            )
-
-
-def test_merge_chromosomes_sample_axis_invalid_haplotype_chunk_raises(tmp_path, synthetic_arrays):
-    left, right = _split_fixture_arrays(synthetic_arrays)
-    s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
-    s2 = ingest_arrays(output_zarr=tmp_path / "right.zarr", chrom="chr21", **right)
-
-    with pytest.raises(ValueError, match="chunk_haplotype_size must be > 0"):
-        with pytest.deprecated_call():
-            merge_chromosomes_sample_axis(
-                input_stores=[s1.path, s2.path],
-                output_store=tmp_path / "out_bad_hap_chunk.zarr",
-                chrom="chr21",
-                chunk_haplotype_size=0,
-            )
-
-
-def test_merge_chromosomes_sample_axis_invalid_sample_chunk_raises(tmp_path, synthetic_arrays):
-    left, right = _split_fixture_arrays(synthetic_arrays)
-    s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
-    s2 = ingest_arrays(output_zarr=tmp_path / "right.zarr", chrom="chr21", **right)
-
-    with pytest.raises(ValueError, match="chunk_sample_size must be > 0"):
-        with pytest.deprecated_call():
-            merge_chromosomes_sample_axis(
-                input_stores=[s1.path, s2.path],
-                output_store=tmp_path / "out_bad_sample_chunk.zarr",
-                chrom="chr21",
-                chunk_sample_size=0,
-            )
-
-
-def test_merge_chromosomes_sample_axis_does_not_require_variant_info_calls(
+def test_concat_hapstores_does_not_require_variant_info_calls(
     tmp_path,
     synthetic_arrays,
     monkeypatch,
@@ -181,16 +101,18 @@ def test_merge_chromosomes_sample_axis_does_not_require_variant_info_calls(
 
     monkeypatch.setattr(HapStore, "variant_info", _bomb_variant_info)
     out_path = tmp_path / "merged_no_variant_info.zarr"
-    with pytest.deprecated_call():
-        merge_chromosomes_sample_axis(
-            input_stores=[s1.path, s2.path],
-            output_store=out_path,
-            chrom="chr21",
-            output_mode="w",
-            chunk_variant_size=2,
-            chunk_haplotype_size=2,
-            chunk_sample_size=1,
-        )
+    concat_hapstores(
+        input_stores=[s1.path, s2.path],
+        output_store=out_path,
+        chrom="chr21",
+        axis="samples",
+        validate="full",
+        n_workers=1,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        overwrite=True,
+    )
 
     merged = HapStore(out_path, mode="r")
     assert merged.n_samples("chr21") == 2

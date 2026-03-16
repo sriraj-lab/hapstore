@@ -12,18 +12,19 @@ from typing import Literal
 
 import numpy as np
 
-from hapstore._internal.ids import read_sample_ids
-from hapstore._internal.chrom import normalize_chrom
+from hapstore.chrom import normalize_chrom
+from hapstore.ids import read_sample_ids
 
 from ._pgen_fast import PgenFastReader, PgenFastWriter, ensure_pgenlib_available
-from .export import (
+from ._internal.export_selection import (
     _iter_variant_slices,
     _iter_variant_slices_for_indices,
     _plan_sample_subset,
     _resolve_variant_indices_streaming,
     _subset_indices_in_requested_order,
-    _to_unicode_array,
 )
+from ._internal.plink import resolve_plink2_binary
+from ._internal.zarr_utils import _to_unicode_array
 from .ingest import ingest_arrays
 from .store import HapStore
 
@@ -112,7 +113,7 @@ def export_pgen(
             on_partial_missing=on_partial_missing,
         )
 
-    plink2_bin = _resolve_plink2_binary(plink2_path)
+    plink2_bin = str(resolve_plink2_binary(plink2_path))
     shard_prefixes: list[Path] = []
     temp_root = Path(tempfile.mkdtemp(prefix=f"{prefix.name}.shards_", dir=str(prefix.parent)))
 
@@ -544,24 +545,6 @@ def _resolve_export_variant_indices(
     if not selected:
         raise ValueError("variant_ids resolved to an empty variant set")
     return selected
-
-
-def _resolve_plink2_binary(plink2_path: str | Path) -> str:
-    text = str(plink2_path)
-    if text == "system":
-        found = shutil.which("plink2")
-        if found is None:
-            raise FileNotFoundError("plink2_path='system' but plink2 is not on PATH")
-        return found
-    if "/" not in text:
-        found = shutil.which(text)
-        if found is None:
-            raise FileNotFoundError(f"plink2 executable not found on PATH: {text}")
-        return found
-    path = Path(text)
-    if not path.exists():
-        raise FileNotFoundError(f"plink2 binary not found: {path}")
-    return str(path)
 
 
 def _merge_pgen_shards_with_plink(

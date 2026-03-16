@@ -1,4 +1,4 @@
-"""Chromosome naming helpers."""
+"""Stable chromosome naming helpers."""
 
 from __future__ import annotations
 

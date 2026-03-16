@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import os
-import shutil
 import tempfile
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-import re
 from typing import Any, Iterable
 
 import numpy as np
@@ -16,24 +11,21 @@ import pysam
 import zarr
 from numcodecs import VLenUTF8, Zstd
 
-from hapstore._internal.chrom import normalize_chrom
+from hapstore.chrom import normalize_chrom
 
+from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.export_selection import (
+    _iter_variant_slices,
+    _iter_variant_slices_for_indices,
+    _plan_sample_subset,
+    _resolve_variant_indices_streaming,
+    _subset_indices_in_requested_order,
+)
+from ._internal.plink import resolve_plink2_binary
+from ._internal.zarr_utils import _to_unicode_array
 from .store import HapStore
 
 _MISSING_SENTINEL = 255
-
-
-@dataclass(frozen=True)
-class _SampleSubsetPlan:
-    selected_sample_ids: list[str]
-    sample_mask: np.ndarray | None
-    hap_perm: np.ndarray | None
-
-
-@dataclass(frozen=True)
-class _ParsedVariantId:
-    kind: str  # "pos" or "vid"
-    value: int | str
 
 
 def export_vcf(
@@ -194,7 +186,7 @@ def _export_vcf_via_pgen(
 
     from .pgen import export_pgen
 
-    plink2_bin = _resolve_plink2_binary(plink2_location)
+    plink2_bin = resolve_plink2_binary(plink2_location)
     chrom_key = normalize_chrom(chrom, prefix=True)
 
     out_path = Path(output_vcf)
@@ -315,18 +307,6 @@ def _export_vcf_via_pgen(
     finally:
         if tmp_root is not None and tmp_root.exists():
             shutil.rmtree(tmp_root)
-
-
-def _resolve_plink2_binary(plink2_location: str | Path) -> Path:
-    if str(plink2_location) == "system":
-        found = shutil.which("plink2")
-        if found is None:
-            raise FileNotFoundError("plink2_location='system' but plink2 is not on PATH")
-        return Path(found)
-    path = Path(plink2_location)
-    if not path.exists():
-        raise FileNotFoundError(f"plink2 binary not found: {path}")
-    return path
 
 
 def _vcf_export_prefix(output_vcf: Path) -> Path:
@@ -526,95 +506,24 @@ def subset_samples_to_new_store(
     )
 
     out_chrom.attrs.update(
-        {
-            "n_samples": int(n_samples),
-            "n_haplotypes": int(n_haplotypes),
-            "n_variants": int(n_variants),
-            "phased": True,
-            "ploidy": 2,
-            "missing_sentinel": _MISSING_SENTINEL,
-            "has_missing": bool(has_missing),
-            "compression": "zstd",
-            "compression_level": int(compression_level),
-            "chunk_variant_size": int(variant_chunk),
-            "chunk_haplotype_size": int(hap_chunk),
-            "chunk_sample_size": None,
-            "layout_version": int(layout_version),
-            "source": src_attrs.get("source"),
-            "build": src_attrs.get("build"),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "extra": extra_payload or None,
-        }
+        build_chrom_attrs(
+            n_samples=int(n_samples),
+            n_haplotypes=int(n_haplotypes),
+            n_variants=int(n_variants),
+            missing_sentinel=_MISSING_SENTINEL,
+            has_missing=bool(has_missing),
+            compression_level=int(compression_level),
+            chunk_variant_size=int(variant_chunk),
+            chunk_haplotype_size=int(hap_chunk),
+            chunk_sample_size=None,
+            layout_version=int(layout_version),
+            source=src_attrs.get("source"),
+            build=src_attrs.get("build"),
+            extra=extra_payload or None,
+        )
     )
 
     return out_path
-
-
-def _plan_sample_subset(all_sample_ids: list[str], subset: list[str] | None) -> _SampleSubsetPlan:
-    if subset is None:
-        return _SampleSubsetPlan(
-            selected_sample_ids=list(all_sample_ids),
-            sample_mask=None,
-            hap_perm=None,
-        )
-
-    if len(set(subset)) != len(subset):
-        raise ValueError("sample_ids must be unique")
-
-    sample_to_index = {sid: i for i, sid in enumerate(all_sample_ids)}
-    missing = [sid for sid in subset if sid not in sample_to_index]
-    if missing:
-        raise ValueError(f"sample_ids not found in store: {missing}")
-
-    subset_idx_requested = np.asarray([sample_to_index[sid] for sid in subset], dtype=np.int64)
-    subset_idx_store_order = np.unique(subset_idx_requested)
-    sample_mask = np.zeros(len(all_sample_ids), dtype=bool)
-    sample_mask[subset_idx_store_order] = True
-
-    pos_in_store = np.searchsorted(subset_idx_store_order, subset_idx_requested)
-    hap_perm = np.empty(subset_idx_requested.shape[0] * 2, dtype=np.int64)
-    hap_perm[0::2] = 2 * pos_in_store
-    hap_perm[1::2] = (2 * pos_in_store) + 1
-
-    return _SampleSubsetPlan(
-        selected_sample_ids=list(subset),
-        sample_mask=sample_mask,
-        hap_perm=hap_perm,
-    )
-
-
-def _iter_variant_slices(n_variants: int, variant_block_size: int) -> Iterable[slice]:
-    for start in range(0, int(n_variants), int(variant_block_size)):
-        end = min(int(n_variants), start + int(variant_block_size))
-        yield slice(int(start), int(end))
-
-
-def _iter_variant_slices_for_indices(indices: list[int], variant_block_size: int) -> Iterable[slice]:
-    if not indices:
-        return
-
-    def _emit_run(start: int, end_exclusive: int) -> Iterable[slice]:
-        current = int(start)
-        while current < int(end_exclusive):
-            nxt = min(int(end_exclusive), current + int(variant_block_size))
-            yield slice(int(current), int(nxt))
-            current = int(nxt)
-
-    sorted_idx = sorted(set(int(i) for i in indices))
-    run_start = int(sorted_idx[0])
-    run_prev = int(sorted_idx[0])
-    for idx in sorted_idx[1:]:
-        idx_i = int(idx)
-        if idx_i == run_prev + 1:
-            run_prev = idx_i
-            continue
-        yield from _emit_run(run_start, run_prev + 1)
-        run_start = idx_i
-        run_prev = idx_i
-
-    yield from _emit_run(run_start, run_prev + 1)
-
-
 def _write_vcf_records_to_open_file(
     out: pysam.VariantFile,
     chrom: str,
@@ -691,111 +600,5 @@ def _validate_variant_alleles(
 
     return ref_clean, alt_clean
 
-
-_POS_LINE_RE = re.compile(r"(?i)\bline\s+(\d+)\b")
-
-
-def _parse_variant_id(chrom_key: str, raw: str) -> _ParsedVariantId:
-    text = str(raw).strip()
-    if text == "":
-        raise ValueError("variant_ids contains an empty string")
-
-    m = _POS_LINE_RE.search(text)
-    if m is not None:
-        pos = int(m.group(1))
-        chrom_part = text.split("(")[0].strip()
-        if chrom_part:
-            chrom_in_id = normalize_chrom(chrom_part, prefix=True)
-            if chrom_in_id != chrom_key:
-                raise ValueError(f"variant_id chrom mismatch: {raw!r} vs chrom={chrom_key!r}")
-        return _ParsedVariantId(kind="pos", value=pos)
-
-    if ":" in text:
-        left, right = text.rsplit(":", 1)
-        if right.isdigit():
-            chrom_in_id = normalize_chrom(left.strip(), prefix=True)
-            if chrom_in_id != chrom_key:
-                raise ValueError(f"variant_id chrom mismatch: {raw!r} vs chrom={chrom_key!r}")
-            return _ParsedVariantId(kind="pos", value=int(right))
-
-    if text.isdigit():
-        return _ParsedVariantId(kind="pos", value=int(text))
-
-    return _ParsedVariantId(kind="vid", value=text)
-
-
-def _resolve_variant_indices_streaming(
-    *,
-    chrom_key: str,
-    pos_ds: Any,
-    vid_ds: Any,
-    variant_ids: list[str],
-    scan_block_size: int,
-) -> list[int]:
-    if len(set(variant_ids)) != len(variant_ids):
-        raise ValueError("variant_ids must be unique")
-
-    parsed = [_parse_variant_id(chrom_key, v) for v in variant_ids]
-    requested_positions = {int(p.value) for p in parsed if p.kind == "pos"}
-    requested_vids = {str(p.value) for p in parsed if p.kind == "vid"}
-
-    found_pos: dict[int, int] = {}
-    found_vid: dict[str, int] = {}
-
-    n_variants = int(pos_ds.shape[0])
-    for start in range(0, n_variants, int(scan_block_size)):
-        end = min(n_variants, start + int(scan_block_size))
-
-        if requested_positions:
-            pos_block = np.asarray(pos_ds[start:end], dtype=np.int64)
-            for offset, p in enumerate(pos_block.tolist()):
-                if p in requested_positions:
-                    if p in found_pos:
-                        raise ValueError(
-                            f"ambiguous position in store for requested pos={p}: "
-                            f"indices {found_pos[p]} and {start + offset}"
-                        )
-                    found_pos[p] = int(start + offset)
-
-        if requested_vids:
-            vid_block = _to_unicode_array(np.asarray(vid_ds[start:end], dtype=object))
-            for offset, v in enumerate(vid_block.tolist()):
-                if v in requested_vids:
-                    if v in found_vid:
-                        raise ValueError(
-                            f"ambiguous vid in store for requested vid={v!r}: "
-                            f"indices {found_vid[v]} and {start + offset}"
-                        )
-                    found_vid[v] = int(start + offset)
-
-    missing_positions = sorted([p for p in requested_positions if p not in found_pos])
-    missing_vids = sorted([v for v in requested_vids if v not in found_vid])
-    if missing_positions or missing_vids:
-        parts = []
-        if missing_positions:
-            parts.append(f"positions={missing_positions}")
-        if missing_vids:
-            parts.append(f"vids={missing_vids}")
-        raise ValueError("variant_ids not found in store: " + ", ".join(parts))
-
-    indices = list(found_pos.values()) + list(found_vid.values())
-    return sorted(set(int(i) for i in indices))
-
-
-def _to_unicode_array(values: np.ndarray) -> np.ndarray:
-    out = np.empty(values.shape[0], dtype=object)
-    for i, value in enumerate(values):
-        if isinstance(value, bytes):
-            out[i] = value.decode("utf-8")
-        else:
-            out[i] = str(value)
-    return out
-
-
 def _to_unicode_list(values: np.ndarray) -> list[str]:
     return [str(x) for x in _to_unicode_array(np.asarray(values, dtype=object)).tolist()]
-
-
-def _subset_indices_in_requested_order(all_sample_ids: list[str], subset: list[str]) -> list[int]:
-    sample_to_index = {sid: i for i, sid in enumerate(all_sample_ids)}
-    return [int(sample_to_index[sid]) for sid in subset]

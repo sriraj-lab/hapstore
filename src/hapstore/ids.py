@@ -1,4 +1,4 @@
-"""ID parsing and alignment helpers."""
+"""Stable ID parsing and alignment helpers."""
 
 from __future__ import annotations
 
@@ -9,12 +9,7 @@ import pandas as pd
 
 
 def read_sample_ids(path: str | Path) -> list[str]:
-    """Read sample IDs from one- or two-column text tables.
-
-    Supported input forms:
-    - one-column IID list (header optional: IID/#IID)
-    - two-column FID IID table (header optional: FID IID)
-    """
+    """Read sample IDs from one- or two-column text tables."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"sample ID file not found: {p}")
@@ -64,5 +59,4 @@ def align_by_ids(df: pd.DataFrame, id_column: str, ids: Sequence[str], context: 
             f"{context}: missing {len(missing)} required IDs; first few: {missing[:5]}"
         )
 
-    aligned = indexed.loc[list(ids)].reset_index()
-    return aligned
+    return indexed.loc[list(ids)].reset_index()
