@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hapstore"
+version = "0.1.0"
+description = "Zarr-backed phased haplotype store with VCF/PGEN I/O"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "numpy>=2.0,<3.0",
+    "pandas>=2.0",
+    "zarr>=2.16,<3",
+    "numcodecs>=0.12,<0.16",
+    "pysam>=0.22",
+]
+
+[project.optional-dependencies]
+pgen = ["pgenlib>=0.91"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

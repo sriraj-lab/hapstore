@@ -1,0 +1,174 @@
+"""Private fast-path wrappers for pgenlib read/write operations.
+
+This module intentionally provides a small compatibility surface used by
+`hapstore.pgen`.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+
+try:  # pragma: no cover - optional dependency import branch
+    import pgenlib as _pgenlib  # type: ignore
+except Exception:  # pragma: no cover
+    _pgenlib = None
+
+
+def ensure_pgenlib_available() -> None:
+    """Raise a clear error when pgenlib is unavailable."""
+    if _pgenlib is None:
+        raise RuntimeError(
+            "pgenlib is required for direct HapStore<->PGEN operations. "
+            "Install pgenlib (>=0.93.0) in the active environment."
+        )
+
+
+class PgenFastWriter:
+    """Thin writer wrapper over pgenlib.PgenWriter."""
+
+    def __init__(self, pgen_path: str | Path, sample_ct: int, variant_ct: int) -> None:
+        ensure_pgenlib_available()
+        if int(sample_ct) <= 0:
+            raise ValueError(f"sample_ct must be > 0, got {sample_ct}")
+        if int(variant_ct) <= 0:
+            raise ValueError(f"variant_ct must be > 0, got {variant_ct}")
+
+        path_bytes = str(Path(pgen_path)).encode("utf-8")
+        self._writer = _pgenlib.PgenWriter(
+            path_bytes,
+            int(sample_ct),
+            variant_ct=int(variant_ct),
+            nonref_flags=False,
+            allele_ct_limit=2,
+            hardcall_phase_present=True,
+        )
+
+    def append_alleles_batch(self, allele_batch: np.ndarray) -> None:
+        arr = np.asarray(allele_batch)
+        if arr.ndim != 2:
+            raise ValueError(f"allele_batch must be 2D, got shape={arr.shape}")
+        if arr.shape[1] % 2 != 0:
+            raise ValueError(
+                f"allele_batch second dimension must be even (2N), got {arr.shape[1]}"
+            )
+        if arr.dtype != np.int32:
+            arr = arr.astype(np.int32, copy=False)
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        self._writer.append_alleles_batch(arr, all_phased=True)
+
+    def close(self) -> None:
+        self._writer.close()
+
+    def __enter__(self) -> "PgenFastWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except Exception:
+            # Preserve the original exception (e.g., validation error inside export loop).
+            pass
+
+
+class PgenFastReader:
+    """Thin reader wrapper over pgenlib.PgenReader/PvarReader."""
+
+    def __init__(
+        self,
+        pgen_path: str | Path,
+        pvar_path: str | Path,
+        sample_subset: np.ndarray | None = None,
+    ) -> None:
+        ensure_pgenlib_available()
+
+        self._pvar = _pgenlib.PvarReader(str(Path(pvar_path)).encode("utf-8"))
+        kwargs: dict[str, object] = {"pvar": self._pvar}
+        if sample_subset is not None:
+            subset = np.asarray(sample_subset, dtype=np.uint32)
+            if subset.ndim != 1:
+                raise ValueError(f"sample_subset must be 1D, got shape={subset.shape}")
+            kwargs["sample_subset"] = subset
+            self._sample_ct = int(subset.shape[0])
+        else:
+            self._sample_ct = None
+
+        self._reader = _pgenlib.PgenReader(str(Path(pgen_path)).encode("utf-8"), **kwargs)
+
+    @property
+    def variant_ct(self) -> int:
+        return int(self._reader.get_variant_ct())
+
+    @property
+    def raw_sample_ct(self) -> int:
+        return int(self._reader.get_raw_sample_ct())
+
+    @property
+    def sample_ct(self) -> int:
+        if self._sample_ct is not None:
+            return int(self._sample_ct)
+        return int(self._reader.get_raw_sample_ct())
+
+    def hardcall_phase_present(self) -> bool:
+        return bool(self._reader.hardcall_phase_present())
+
+    def read_alleles_and_phasepresent_range(
+        self,
+        start: int,
+        end: int,
+        allele_buf: np.ndarray,
+        phasepresent_buf: np.ndarray,
+    ) -> None:
+        alleles = np.asarray(allele_buf, dtype=np.int32)
+        phase = np.asarray(phasepresent_buf, dtype=np.uint8)
+        if not alleles.flags["C_CONTIGUOUS"]:
+            raise ValueError("allele_buf must be C-contiguous")
+        if not phase.flags["C_CONTIGUOUS"]:
+            raise ValueError("phasepresent_buf must be C-contiguous")
+        self._reader.read_alleles_and_phasepresent_range(
+            int(start),
+            int(end),
+            alleles,
+            phase,
+            hap_maj=False,
+        )
+
+    def variant_chrom(self, variant_idx: int) -> str:
+        val = self._pvar.get_variant_chrom(int(variant_idx))
+        if isinstance(val, bytes):
+            return val.decode("utf-8")
+        return str(val)
+
+    def variant_pos(self, variant_idx: int) -> int:
+        return int(self._pvar.get_variant_pos(int(variant_idx)))
+
+    def variant_id(self, variant_idx: int) -> str:
+        val = self._pvar.get_variant_id(int(variant_idx))
+        if isinstance(val, bytes):
+            return val.decode("utf-8")
+        return str(val)
+
+    def allele_ct(self, variant_idx: int) -> int:
+        return int(self._pvar.get_allele_ct(int(variant_idx)))
+
+    def allele_code(self, variant_idx: int, allele_idx: int) -> str:
+        val = self._pvar.get_allele_code(int(variant_idx), int(allele_idx))
+        if isinstance(val, bytes):
+            return val.decode("utf-8")
+        return str(val)
+
+    def close(self) -> None:
+        self._reader.close()
+        self._pvar.close()
+
+    def __enter__(self) -> "PgenFastReader":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
