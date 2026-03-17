@@ -7,11 +7,12 @@ from typing import Any, Literal
 
 import numpy as np
 
+from hapstore.store import _MISSING_SENTINEL
+
 Backend = Literal["auto", "cyvcf2", "pysam", "text"]
 MissingRefAltPolicy = Literal["error", "dot"]
 MissingVidPolicy = Literal["dot", "error"]
 UnphasedPolicy = Literal["missing", "error"]
-_MISSING_SENTINEL = 255
 
 
 @dataclass

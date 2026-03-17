@@ -19,12 +19,12 @@ from hapstore._internal.ingest_models import (
     _StreamingFinalizeContext,
 )
 from hapstore.chrom import normalize_chrom
-from hapstore.store import HapStore
+from hapstore.store import HapStore, _haplotypes_to_genotypes
 
 logger = logging.getLogger(__name__)
 
 
-def _to_unicode_array(values: np.ndarray) -> np.ndarray:
+def _to_unicode_array_safe(values: np.ndarray) -> np.ndarray:
     arr = np.asarray(values, dtype=object)
     out = np.empty(arr.shape, dtype=object)
     it = np.nditer(arr, flags=["refs_ok", "multi_index", "zerosize_ok"])
@@ -32,14 +32,6 @@ def _to_unicode_array(values: np.ndarray) -> np.ndarray:
         value = item.item()
         out[it.multi_index] = "" if value is None else str(value)
     return out
-
-
-def _haplotypes_to_genotypes_local(haplotypes: np.ndarray) -> np.ndarray:
-    if haplotypes.ndim != 2 or haplotypes.shape[0] % 2 != 0:
-        raise ValueError("haplotypes must have shape (2*n_samples, n_variants)")
-    even = haplotypes[0::2, :]
-    odd = haplotypes[1::2, :]
-    return (even + odd).astype(np.uint8, copy=False)
 
 
 def _validate_cross_chrom_samples(store: HapStore, sample_ids: np.ndarray, chrom_key: str) -> None:
@@ -50,7 +42,7 @@ def _validate_cross_chrom_samples(store: HapStore, sample_ids: np.ndarray, chrom
     if not existing:
         return
     existing_ids = np.asarray(store.root[f"{existing[0]}/samples/ids"][:], dtype=object)
-    existing_ids = _to_unicode_array(existing_ids)
+    existing_ids = _to_unicode_array_safe(existing_ids)
     if existing_ids.shape != sample_ids.shape or not np.array_equal(existing_ids, sample_ids):
         raise ValueError("sample IDs must match across chromosomes in the same HapStore")
 
@@ -120,7 +112,7 @@ def _create_streaming_finalize_context(
     compression_level: int,
 ) -> _StreamingFinalizeContext:
     chrom_key = normalize_chrom(chrom, prefix=True)
-    sample_ids_u = _to_unicode_array(np.asarray(subset_ids, dtype=object))
+    sample_ids_u = _to_unicode_array_safe(np.asarray(subset_ids, dtype=object))
     n_samples = int(sample_ids_u.shape[0])
     n_haplotypes = 2 * n_samples
 
@@ -288,7 +280,7 @@ def _stream_finalize_write_shard(
         sl = slice(int(ctx.offset), next_offset)
         ctx.hap_arr[:, sl] = h
         if ctx.geno_arr is not None:
-            ctx.geno_arr[:, sl] = _haplotypes_to_genotypes_local(h)
+            ctx.geno_arr[:, sl] = _haplotypes_to_genotypes(h)
         ctx.pos_arr[sl] = positions
         ctx.ref_arr[sl] = ref
         ctx.alt_arr[sl] = alt

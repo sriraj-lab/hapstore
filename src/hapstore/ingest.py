@@ -42,9 +42,7 @@ from ._internal.ingest_finalize import (
     _create_streaming_finalize_context,
     _ensure_streaming_finalize_capacity,
     _estimate_initial_variant_capacity,
-    _haplotypes_to_genotypes_local,
     _stream_finalize_write_shard,
-    _to_unicode_array,
     _validate_cross_chrom_samples,
 )
 from ._internal.ingest_models import (
@@ -823,6 +821,34 @@ def _write_partition_manifest(
     manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _serialize_shard_to_artifact(
+    shard: _ShardResult,
+    start: int | None,
+    end: int | None,
+    artifacts_dir: str,
+) -> _ShardArtifactMeta:
+    artifact_path = Path(artifacts_dir) / f"shard_{int(shard.shard_index):06d}.npz"
+    np.savez(
+        str(artifact_path),
+        haplotypes=np.asarray(shard.haplotypes, dtype=np.uint8),
+        positions=np.asarray(shard.positions, dtype=np.int64),
+        ref=np.asarray(shard.ref, dtype=str),
+        alt=np.asarray(shard.alt, dtype=str),
+        vid=np.asarray(shard.vid, dtype=str),
+    )
+    return _ShardArtifactMeta(
+        shard_index=int(shard.shard_index),
+        start=None if start is None else int(start),
+        end=None if end is None else int(end),
+        artifact_path=str(artifact_path),
+        n_variants=int(shard.positions.shape[0]),
+        missing_ref_count=int(shard.missing_ref_count),
+        missing_alt_count=int(shard.missing_alt_count),
+        missing_vid_count=int(shard.missing_vid_count),
+        unphased_gt_count=int(shard.unphased_gt_count),
+    )
+
+
 def _materialize_pysam_shard_worker(
     vcf_path: str,
     contig: str,
@@ -846,26 +872,7 @@ def _materialize_pysam_shard_worker(
         on_unphased_gt=on_unphased_gt,
         shard_index=shard_index,
     )
-    artifact_path = Path(artifacts_dir) / f"shard_{int(shard_index):06d}.npz"
-    np.savez(
-        str(artifact_path),
-        haplotypes=np.asarray(shard.haplotypes, dtype=np.uint8),
-        positions=np.asarray(shard.positions, dtype=np.int64),
-        ref=np.asarray(shard.ref, dtype=str),
-        alt=np.asarray(shard.alt, dtype=str),
-        vid=np.asarray(shard.vid, dtype=str),
-    )
-    return _ShardArtifactMeta(
-        shard_index=int(shard_index),
-        start=None if start is None else int(start),
-        end=None if end is None else int(end),
-        artifact_path=str(artifact_path),
-        n_variants=int(shard.positions.shape[0]),
-        missing_ref_count=int(shard.missing_ref_count),
-        missing_alt_count=int(shard.missing_alt_count),
-        missing_vid_count=int(shard.missing_vid_count),
-        unphased_gt_count=int(shard.unphased_gt_count),
-    )
+    return _serialize_shard_to_artifact(shard, start, end, artifacts_dir)
 
 
 def _materialize_cyvcf2_shard_worker(
@@ -891,26 +898,7 @@ def _materialize_cyvcf2_shard_worker(
         on_unphased_gt=on_unphased_gt,
         shard_index=shard_index,
     )
-    artifact_path = Path(artifacts_dir) / f"shard_{int(shard_index):06d}.npz"
-    np.savez(
-        str(artifact_path),
-        haplotypes=np.asarray(shard.haplotypes, dtype=np.uint8),
-        positions=np.asarray(shard.positions, dtype=np.int64),
-        ref=np.asarray(shard.ref, dtype=str),
-        alt=np.asarray(shard.alt, dtype=str),
-        vid=np.asarray(shard.vid, dtype=str),
-    )
-    return _ShardArtifactMeta(
-        shard_index=int(shard_index),
-        start=None if start is None else int(start),
-        end=None if end is None else int(end),
-        artifact_path=str(artifact_path),
-        n_variants=int(shard.positions.shape[0]),
-        missing_ref_count=int(shard.missing_ref_count),
-        missing_alt_count=int(shard.missing_alt_count),
-        missing_vid_count=int(shard.missing_vid_count),
-        unphased_gt_count=int(shard.unphased_gt_count),
-    )
+    return _serialize_shard_to_artifact(shard, start, end, artifacts_dir)
 
 
 def _read_cyvcf2_shard_worker(

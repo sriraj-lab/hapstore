@@ -75,6 +75,24 @@ def test_ingest_pgen_unphased_policy_error(tmp_path):
         )
 
 
+def test_ingest_pgen_unphased_policy_error_parallel(tmp_path):
+    prefix = _write_triplet(
+        tmp_path / "unphased_parallel",
+        allele_rows=np.asarray([[0, 1], [1, 1]], dtype=np.int32),
+        phase_rows=np.asarray([[0], [1]], dtype=np.uint8),
+    )
+
+    with pytest.raises(ValueError, match="unphased heterozygous genotype"):
+        ingest_pgen(
+            pgen_prefix=prefix,
+            output_zarr=tmp_path / "out_error_parallel.zarr",
+            chrom="1",
+            on_unphased_gt="error",
+            workers=2,
+            variant_block_size=1,
+        )
+
+
 def test_ingest_pgen_unphased_policy_missing(tmp_path):
     prefix = _write_triplet(
         tmp_path / "unphased_missing",
@@ -99,6 +117,34 @@ def test_ingest_pgen_unphased_policy_missing(tmp_path):
     assert int(extra.get("unphased_gt_count", -1)) == 1
 
 
+def test_ingest_pgen_unphased_policy_missing_parallel(tmp_path):
+    prefix = _write_triplet(
+        tmp_path / "unphased_missing_parallel",
+        allele_rows=np.asarray([[0, 1], [1, 1]], dtype=np.int32),
+        phase_rows=np.asarray([[0], [1]], dtype=np.uint8),
+    )
+
+    out = ingest_pgen(
+        pgen_prefix=prefix,
+        output_zarr=tmp_path / "out_missing_parallel.zarr",
+        chrom="1",
+        on_unphased_gt="missing",
+        workers=2,
+        variant_block_size=1,
+    )
+
+    h = out.haplotypes("1")
+    assert h.shape == (2, 2)
+    assert int(h[0, 0]) == 255
+    assert int(h[1, 0]) == 255
+    assert int(h[0, 1]) == 1
+    assert int(h[1, 1]) == 1
+
+    extra = out.attrs("1").get("extra")
+    assert isinstance(extra, dict)
+    assert int(extra.get("unphased_gt_count", -1)) == 1
+
+
 def test_ingest_pgen_rejects_non_biallelic_pvar(tmp_path):
     prefix = _write_triplet(
         tmp_path / "multi_alt",
@@ -113,6 +159,25 @@ def test_ingest_pgen_rejects_non_biallelic_pvar(tmp_path):
             output_zarr=tmp_path / "out_multi.zarr",
             chrom="1",
             strict_biallelic=True,
+        )
+
+
+def test_ingest_pgen_rejects_non_biallelic_parallel(tmp_path):
+    prefix = _write_triplet(
+        tmp_path / "multi_alt_parallel",
+        allele_rows=np.asarray([[0, 1], [0, 1]], dtype=np.int32),
+        phase_rows=np.asarray([[1], [1]], dtype=np.uint8),
+        alt_field="G,C",
+    )
+
+    with pytest.raises(ValueError, match="non-biallelic"):
+        ingest_pgen(
+            pgen_prefix=prefix,
+            output_zarr=tmp_path / "out_multi_parallel.zarr",
+            chrom="1",
+            strict_biallelic=True,
+            workers=2,
+            variant_block_size=1,
         )
 
 
@@ -157,3 +222,85 @@ def test_ingest_pgen_sample_subset_order(tmp_path):
 
     hs = HapStore(tmp_path / "out_subset.zarr", mode="r")
     assert hs.n_samples("1") == 2
+
+
+def test_ingest_pgen_sample_subset_order_parallel(tmp_path):
+    prefix = _write_triplet(
+        tmp_path / "subset_parallel",
+        allele_rows=np.asarray(
+            [
+                [0, 1, 1, 1, 1, 0],
+                [1, 0, 0, 0, 0, 1],
+                [1, 1, 0, 1, 1, 0],
+            ],
+            dtype=np.int32,
+        ),
+        phase_rows=np.asarray(
+            [
+                [1, 1, 1],
+                [1, 1, 1],
+                [1, 1, 1],
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+    out = ingest_pgen(
+        pgen_prefix=prefix,
+        output_zarr=tmp_path / "out_subset_parallel.zarr",
+        chrom="1",
+        sample_ids=["s3", "s1"],
+        workers=2,
+        variant_block_size=1,
+    )
+
+    assert out.sample_ids("1") == ["s3", "s1"]
+    h = out.haplotypes("1")
+    expected = np.asarray(
+        [
+            [1, 0, 1],
+            [0, 1, 0],
+            [0, 1, 1],
+            [1, 0, 1],
+        ],
+        dtype=np.uint8,
+    )
+    np.testing.assert_array_equal(h, expected)
+
+
+def test_ingest_pgen_parallel_matches_serial_roundtrip(tmp_path):
+    allele_rows = np.asarray(
+        [
+            [0, 1, 1, 1, 1, 0, 0, 0],
+            [1, 0, 0, 0, 0, 1, 1, 1],
+            [1, 1, 0, 1, 1, 0, 0, 1],
+            [0, 0, 1, 0, 0, 1, 1, 0],
+        ],
+        dtype=np.int32,
+    )
+    phase_rows = np.ones((allele_rows.shape[0], allele_rows.shape[1] // 2), dtype=np.uint8)
+    prefix = _write_triplet(
+        tmp_path / "serial_vs_parallel",
+        allele_rows=allele_rows,
+        phase_rows=phase_rows,
+    )
+
+    serial = ingest_pgen(
+        pgen_prefix=prefix,
+        output_zarr=tmp_path / "serial.zarr",
+        chrom="1",
+        variant_block_size=2,
+        workers=1,
+    )
+    parallel = ingest_pgen(
+        pgen_prefix=prefix,
+        output_zarr=tmp_path / "parallel.zarr",
+        chrom="1",
+        variant_block_size=2,
+        workers=2,
+    )
+
+    np.testing.assert_array_equal(serial.haplotypes("1"), parallel.haplotypes("1"))
+    assert serial.variant_positions("1").tolist() == parallel.variant_positions("1").tolist()
+    assert serial.sample_ids("1") == parallel.sample_ids("1")
+    assert serial.attrs("1").get("extra") == parallel.attrs("1").get("extra")

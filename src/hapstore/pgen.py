@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Literal
 
 import numpy as np
@@ -16,6 +17,7 @@ from hapstore.chrom import normalize_chrom
 from hapstore.ids import read_sample_ids
 
 from ._pgen_fast import PgenFastReader, PgenFastWriter, ensure_pgenlib_available
+from ._internal.chrom_attrs import build_chrom_attrs
 from ._internal.export_selection import (
     _iter_variant_slices,
     _iter_variant_slices_for_indices,
@@ -23,12 +25,17 @@ from ._internal.export_selection import (
     _resolve_variant_indices_streaming,
     _subset_indices_in_requested_order,
 )
+from ._internal.ingest_finalize import (
+    _abort_streaming_finalize,
+    _complete_streaming_finalize,
+    _create_streaming_finalize_context,
+    _stream_finalize_write_shard,
+)
+from ._internal.ingest_models import _PartitionPlan, _ShardArtifactMeta, _ShardSpec
 from ._internal.plink import resolve_plink2_binary
 from ._internal.zarr_utils import _to_unicode_array
 from .ingest import ingest_arrays
-from .store import HapStore
-
-_MISSING_SENTINEL = 255
+from .store import HapStore, _MISSING_SENTINEL
 
 PartialMissingPolicy = Literal["error", "missing"]
 UnphasedPolicy = Literal["error", "missing"]
@@ -321,6 +328,7 @@ def ingest_pgen(
     variant_block_size: int = 8192,
     on_unphased_gt: UnphasedPolicy = "error",
     strict_biallelic: bool = True,
+    workers: int = 1,
     chunk_variant_size: int = 500,
     chunk_haplotype_size: int | None = None,
     chunk_sample_size: int | None = None,
@@ -337,6 +345,8 @@ def ingest_pgen(
         raise ValueError(f"variant_block_size must be positive, got {variant_block_size}")
     if on_unphased_gt not in {"error", "missing"}:
         raise ValueError(f"on_unphased_gt must be 'error' or 'missing', got {on_unphased_gt!r}")
+    if int(workers) <= 0:
+        raise ValueError(f"workers must be >=1, got {workers}")
 
     prefix = _normalize_pgen_prefix(pgen_prefix)
     pgen_path, pvar_path, psam_path = _pgen_paths(prefix)
@@ -345,20 +355,33 @@ def ingest_pgen(
     chrom_key = normalize_chrom(chrom, prefix=True)
     all_sample_ids = read_sample_ids(psam_path)
     sample_plan = _plan_sample_subset(all_sample_ids, sample_ids)
-
-    reader_subset: np.ndarray | None = None
-    hap_reorder: np.ndarray | None = None
     selected_sample_ids = sample_plan.selected_sample_ids
-    if sample_plan.sample_mask is not None:
-        req_indices = _subset_indices_in_requested_order(all_sample_ids, selected_sample_ids)
-        sorted_indices = np.asarray(sorted(req_indices), dtype=np.uint32)
-        reader_subset = sorted_indices
+    reader_subset, hap_reorder = _resolve_pgen_ingest_sample_subset(
+        all_sample_ids=all_sample_ids,
+        selected_sample_ids=selected_sample_ids,
+        sample_mask=sample_plan.sample_mask,
+    )
 
-        idx_to_pos = {int(idx): i for i, idx in enumerate(sorted_indices.tolist())}
-        pos_in_sorted = np.asarray([idx_to_pos[int(i)] for i in req_indices], dtype=np.int64)
-        hap_reorder = np.empty(2 * pos_in_sorted.shape[0], dtype=np.int64)
-        hap_reorder[0::2] = 2 * pos_in_sorted
-        hap_reorder[1::2] = (2 * pos_in_sorted) + 1
+    if int(workers) > 1:
+        return _ingest_pgen_parallel(
+            pgen_path=pgen_path,
+            pvar_path=pvar_path,
+            output_zarr=output_zarr,
+            chrom_key=chrom_key,
+            selected_sample_ids=selected_sample_ids,
+            reader_subset=reader_subset,
+            hap_reorder=hap_reorder,
+            variant_block_size=int(variant_block_size),
+            on_unphased_gt=on_unphased_gt,
+            strict_biallelic=bool(strict_biallelic),
+            workers=int(workers),
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=int(compression_level),
+            store_genotypes=bool(store_genotypes),
+            attrs=attrs,
+        )
 
     positions: list[int] = []
     refs: list[str] = []
@@ -482,6 +505,369 @@ def ingest_pgen(
         compression_level=int(compression_level),
         attrs=attrs_payload,
     )
+
+
+def _resolve_pgen_ingest_sample_subset(
+    *,
+    all_sample_ids: list[str],
+    selected_sample_ids: list[str],
+    sample_mask: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if sample_mask is None:
+        return None, None
+
+    req_indices = _subset_indices_in_requested_order(all_sample_ids, selected_sample_ids)
+    sorted_indices = np.asarray(sorted(req_indices), dtype=np.uint32)
+    idx_to_pos = {int(idx): i for i, idx in enumerate(sorted_indices.tolist())}
+    pos_in_sorted = np.asarray([idx_to_pos[int(i)] for i in req_indices], dtype=np.int64)
+    hap_reorder = np.empty(2 * pos_in_sorted.shape[0], dtype=np.int64)
+    hap_reorder[0::2] = 2 * pos_in_sorted
+    hap_reorder[1::2] = (2 * pos_in_sorted) + 1
+    return sorted_indices, hap_reorder
+
+
+def _scan_pgen_metadata(
+    *,
+    pgen_path: Path,
+    pvar_path: Path,
+    chrom_key: str,
+    strict_biallelic: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    positions: list[int] = []
+    refs: list[str] = []
+    alts: list[str] = []
+    vids: list[str] = []
+
+    with PgenFastReader(pgen_path=pgen_path, pvar_path=pvar_path) as reader:
+        n_variants = int(reader.variant_ct)
+        if n_variants <= 0:
+            raise ValueError(f"no variants found in {pgen_path}")
+
+        for vidx in range(n_variants):
+            var_chrom = normalize_chrom(reader.variant_chrom(vidx), prefix=True)
+            if var_chrom != chrom_key:
+                raise ValueError(
+                    f"pvar chromosome mismatch at variant {vidx}: {var_chrom!r} vs requested {chrom_key!r}"
+                )
+
+            allele_ct = int(reader.allele_ct(vidx))
+            ref_i = reader.allele_code(vidx, 0)
+            alt_i = reader.allele_code(vidx, 1) if allele_ct >= 2 else "."
+            if strict_biallelic and allele_ct > 2:
+                raise ValueError(
+                    f"non-biallelic variant encountered at {chrom_key}:{reader.variant_pos(vidx)} "
+                    f"(allele_ct={allele_ct})"
+                )
+
+            pos_i = int(reader.variant_pos(vidx))
+            ref_i, alt_i = _normalize_ref_alt_for_pvar(
+                ref=ref_i,
+                alt=alt_i,
+                strict_biallelic=bool(strict_biallelic),
+                chrom_key=chrom_key,
+                pos=pos_i,
+            )
+            raw_vid = reader.variant_id(vidx).strip()
+
+            positions.append(pos_i)
+            refs.append(ref_i)
+            alts.append(alt_i)
+            vids.append(raw_vid if raw_vid not in {"", "."} else ".")
+
+    return (
+        np.asarray(positions, dtype=np.int64),
+        np.asarray(refs, dtype=np.str_),
+        np.asarray(alts, dtype=np.str_),
+        np.asarray(vids, dtype=np.str_),
+    )
+
+
+def _partition_pgen_variant_shards(*, n_variants: int, workers: int) -> list[_ShardSpec]:
+    if int(n_variants) <= 0:
+        raise ValueError(f"n_variants must be > 0, got {n_variants}")
+    parts = [arr for arr in np.array_split(np.arange(int(n_variants), dtype=np.int64), int(workers)) if arr.size > 0]
+    return [
+        _ShardSpec(
+            shard_index=int(shard_index),
+            start_bp=int(part[0]),
+            end_bp=int(part[-1]) + 1,
+        )
+        for shard_index, part in enumerate(parts)
+    ]
+
+
+def _pgen_shard_npz_path(scratch_dir: Path, shard_index: int) -> Path:
+    return scratch_dir / f"pgen_ingest_shard_{int(shard_index):04d}.npz"
+
+
+def _read_pgen_shard_worker(
+    *,
+    pgen_path: str,
+    pvar_path: str,
+    start_variant: int,
+    end_variant: int,
+    reader_subset: np.ndarray | None,
+    hap_reorder: np.ndarray | None,
+    positions: np.ndarray,
+    ref: np.ndarray,
+    alt: np.ndarray,
+    vid: np.ndarray,
+    strict_biallelic: bool,
+    on_unphased_gt: UnphasedPolicy,
+    shard_index: int,
+    artifact_path: str,
+) -> _ShardArtifactMeta:
+    start = int(start_variant)
+    end = int(end_variant)
+    if start < 0 or end <= start:
+        raise ValueError(f"invalid shard range [{start}, {end})")
+
+    with PgenFastReader(
+        pgen_path=Path(pgen_path),
+        pvar_path=Path(pvar_path),
+        sample_subset=reader_subset,
+    ) as reader:
+        block_n = int(end - start)
+        n_samples_reader = int(reader.sample_ct)
+        allele_block = np.empty((block_n, 2 * n_samples_reader), dtype=np.int32, order="C")
+        phase_block = np.empty((block_n, n_samples_reader), dtype=np.uint8, order="C")
+        reader.read_alleles_and_phasepresent_range(start, end, allele_block, phase_block)
+
+    valid = allele_block >= 0
+    if strict_biallelic and np.any(allele_block[valid] > 1):
+        bad = np.argwhere((allele_block >= 0) & (allele_block > 1))[0]
+        rel_vidx = int(bad[0])
+        pos = int(positions[rel_vidx])
+        raise ValueError(
+            f"non-biallelic allele code encountered while ingesting shard {shard_index} "
+            f"at position {pos}"
+        )
+
+    a0 = allele_block[:, 0::2]
+    a1 = allele_block[:, 1::2]
+    missing = (a0 < 0) | (a1 < 0)
+    het = (a0 != a1) & (~missing)
+    unphased_het = (phase_block == 0) & het
+    unphased_gt_count = 0
+
+    if bool(np.any(unphased_het)):
+        unphased_gt_count = int(np.sum(unphased_het))
+        if on_unphased_gt == "error":
+            first = np.argwhere(unphased_het)[0]
+            rel_vidx = int(first[0])
+            sample_i = int(first[1])
+            pos = int(positions[rel_vidx])
+            raise ValueError(
+                "unphased heterozygous genotype encountered while ingesting PGEN "
+                f"(variant={pos}, sample_index={sample_i})"
+            )
+        a0[unphased_het] = -9
+        a1[unphased_het] = -9
+
+    pair_missing = (a0 < 0) | (a1 < 0)
+    a0[pair_missing] = -9
+    a1[pair_missing] = -9
+
+    haplotypes = allele_block.T
+    haplotypes = np.where(haplotypes < 0, _MISSING_SENTINEL, haplotypes).astype(np.uint8, copy=False)
+    if hap_reorder is not None:
+        haplotypes = haplotypes[hap_reorder, :]
+    haplotypes = np.ascontiguousarray(haplotypes)
+
+    artifact = Path(artifact_path)
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        artifact,
+        haplotypes=haplotypes,
+        positions=np.asarray(positions, dtype=np.int64),
+        ref=np.asarray(ref, dtype=np.str_),
+        alt=np.asarray(alt, dtype=np.str_),
+        vid=np.asarray(vid, dtype=np.str_),
+    )
+
+    return _ShardArtifactMeta(
+        shard_index=int(shard_index),
+        start=int(start),
+        end=int(end),
+        artifact_path=str(artifact),
+        n_variants=int(haplotypes.shape[1]),
+        missing_ref_count=0,
+        missing_alt_count=0,
+        missing_vid_count=0,
+        unphased_gt_count=int(unphased_gt_count),
+    )
+
+
+def _restore_parallel_pgen_attrs(
+    *,
+    store: HapStore,
+    chrom_key: str,
+    attrs_payload: dict[str, object],
+    chunk_variant_size: int,
+    chunk_haplotype_size: int | None,
+    chunk_sample_size: int | None,
+    compression_level: int,
+) -> None:
+    chrom_group = store.root[chrom_key]
+    n_samples = int(chrom_group.attrs["n_samples"])
+    n_haplotypes = int(chrom_group.attrs["n_haplotypes"])
+    n_variants = int(chrom_group.attrs["n_variants"])
+    has_missing = bool(chrom_group.attrs["has_missing"])
+    layout_version = int(chrom_group.attrs["layout_version"])
+    extra_payload = dict(attrs_payload)
+    source = extra_payload.pop("source", None)
+    build = extra_payload.pop("build", None)
+    chrom_group.attrs.update(
+        build_chrom_attrs(
+            n_samples=n_samples,
+            n_haplotypes=n_haplotypes,
+            n_variants=n_variants,
+            missing_sentinel=int(_MISSING_SENTINEL),
+            has_missing=has_missing,
+            compression_level=int(compression_level),
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            layout_version=int(layout_version),
+            source=source,
+            build=build,
+            extra=extra_payload or None,
+        )
+    )
+
+
+def _ingest_pgen_parallel(
+    *,
+    pgen_path: Path,
+    pvar_path: Path,
+    output_zarr: str | Path,
+    chrom_key: str,
+    selected_sample_ids: list[str],
+    reader_subset: np.ndarray | None,
+    hap_reorder: np.ndarray | None,
+    variant_block_size: int,
+    on_unphased_gt: UnphasedPolicy,
+    strict_biallelic: bool,
+    workers: int,
+    chunk_variant_size: int,
+    chunk_haplotype_size: int | None,
+    chunk_sample_size: int | None,
+    compression_level: int,
+    store_genotypes: bool,
+    attrs: dict | None,
+) -> HapStore:
+    positions, ref, alt, vid = _scan_pgen_metadata(
+        pgen_path=pgen_path,
+        pvar_path=pvar_path,
+        chrom_key=chrom_key,
+        strict_biallelic=bool(strict_biallelic),
+    )
+    n_variants = int(positions.shape[0])
+    if n_variants <= 0:
+        raise ValueError(f"no variants found in {pgen_path}")
+
+    shard_specs = _partition_pgen_variant_shards(n_variants=n_variants, workers=int(workers))
+    if len(shard_specs) <= 1:
+        return ingest_pgen(
+            pgen_prefix=_normalize_pgen_prefix(pgen_path),
+            output_zarr=output_zarr,
+            chrom=chrom_key,
+            sample_ids=selected_sample_ids,
+            variant_block_size=int(variant_block_size),
+            on_unphased_gt=on_unphased_gt,
+            strict_biallelic=bool(strict_biallelic),
+            workers=1,
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=int(compression_level),
+            store_genotypes=bool(store_genotypes),
+            attrs=attrs,
+        )
+
+    scratch_root = Path(tempfile.mkdtemp(prefix=f"{Path(output_zarr).stem}.pgen_ingest_", dir=str(Path(output_zarr).parent)))
+    attrs_payload = dict(attrs or {})
+    attrs_payload.setdefault("source", "pgen")
+    partition_plan = _PartitionPlan(partition_bp=int(variant_block_size), shards=shard_specs)
+    ctx = _create_streaming_finalize_context(
+        output_zarr=output_zarr,
+        chrom=chrom_key,
+        subset_ids=np.asarray(selected_sample_ids, dtype=object),
+        shard_specs=shard_specs,
+        map_df=None,
+        store_genotypes=bool(store_genotypes),
+        chunk_variant_size=int(chunk_variant_size),
+        chunk_haplotype_size=chunk_haplotype_size,
+        chunk_sample_size=chunk_sample_size,
+        compression_level=int(compression_level),
+    )
+
+    try:
+        mp_context = mp.get_context("spawn")
+        futures: list[concurrent.futures.Future[_ShardArtifactMeta]] = []
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=min(int(workers), len(shard_specs)),
+            mp_context=mp_context,
+        ) as pool:
+            for spec in shard_specs:
+                start = int(spec.start_bp or 0)
+                end = int(spec.end_bp or 0)
+                futures.append(
+                    pool.submit(
+                        _read_pgen_shard_worker,
+                        pgen_path=str(pgen_path),
+                        pvar_path=str(pvar_path),
+                        start_variant=start,
+                        end_variant=end,
+                        reader_subset=reader_subset,
+                        hap_reorder=hap_reorder,
+                        positions=positions[start:end],
+                        ref=ref[start:end],
+                        alt=alt[start:end],
+                        vid=vid[start:end],
+                        strict_biallelic=bool(strict_biallelic),
+                        on_unphased_gt=on_unphased_gt,
+                        shard_index=int(spec.shard_index),
+                        artifact_path=str(_pgen_shard_npz_path(scratch_root, int(spec.shard_index))),
+                    )
+                )
+
+            shard_results = sorted((fut.result() for fut in futures), key=lambda meta: int(meta.shard_index))
+
+        finalize_t0 = time.perf_counter()
+        for shard_index in range(len(shard_specs)):
+            _stream_finalize_write_shard(
+                ctx=ctx,
+                shard_index=shard_index,
+                meta=shard_results[shard_index],
+                chrom=chrom_key,
+                map_df=None,
+                started_at=finalize_t0,
+                missing_sentinel=_MISSING_SENTINEL,
+            )
+        store = _complete_streaming_finalize(
+            ctx=ctx,
+            attrs=attrs_payload,
+            workers=int(workers),
+            partition_plan=partition_plan,
+            missing_sentinel=_MISSING_SENTINEL,
+        )
+        attrs_payload["unphased_gt_count"] = int(ctx.unphased_gt_count)
+        _restore_parallel_pgen_attrs(
+            store=store,
+            chrom_key=chrom_key,
+            attrs_payload=attrs_payload,
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=int(compression_level),
+        )
+        return store
+    except Exception:
+        _abort_streaming_finalize(ctx)
+        raise
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
 
 
 def _normalize_pgen_prefix(path_like: str | Path) -> Path:

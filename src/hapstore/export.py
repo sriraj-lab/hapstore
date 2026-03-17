@@ -23,9 +23,7 @@ from ._internal.export_selection import (
 )
 from ._internal.plink import resolve_plink2_binary
 from ._internal.zarr_utils import _to_unicode_array
-from .store import HapStore
-
-_MISSING_SENTINEL = 255
+from .store import HapStore, _MISSING_SENTINEL
 
 
 def export_vcf(

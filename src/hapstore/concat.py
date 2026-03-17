@@ -23,10 +23,7 @@ from ._internal.concat_copy import (
     _copy_dense_matrices,
 )
 from ._internal.zarr_utils import _create_utf8_array, _to_unicode_array
-from .store import HapStore
-
-
-_MISSING_SENTINEL = 255
+from .store import HapStore, _MISSING_SENTINEL
 
 
 @dataclass
