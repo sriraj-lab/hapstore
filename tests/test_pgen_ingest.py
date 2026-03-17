@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from hapstore import HapStore, ingest_pgen
+from hapstore.ids import read_sample_ids
 
 
 try:  # pragma: no cover
@@ -304,3 +305,15 @@ def test_ingest_pgen_parallel_matches_serial_roundtrip(tmp_path):
     assert serial.variant_positions("1").tolist() == parallel.variant_positions("1").tolist()
     assert serial.sample_ids("1") == parallel.sample_ids("1")
     assert serial.attrs("1").get("extra") == parallel.attrs("1").get("extra")
+
+
+def test_read_sample_ids_parses_iid_only_psam_layout(tmp_path):
+    psam_path = tmp_path / "chr5.psam"
+    psam_path.write_text(
+        "#IID\tSEX\tPHENO\n"
+        "AFR_syn1\tNA\tNA\n"
+        "AFR_syn2\tNA\tNA\n",
+        encoding="utf-8",
+    )
+
+    assert read_sample_ids(psam_path) == ["AFR_syn1", "AFR_syn2"]

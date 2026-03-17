@@ -15,24 +15,35 @@ def read_sample_ids(path: str | Path) -> list[str]:
         raise FileNotFoundError(f"sample ID file not found: {p}")
 
     sample_ids: list[str] = []
+    iid_col: int | None = None
     with p.open("r", encoding="utf-8") as handle:
         for line in handle:
             raw = line.strip()
-            if not raw or raw.startswith("#"):
+            if not raw:
                 continue
 
             parts = raw.split()
-            if len(parts) == 1:
-                token = parts[0]
-                if token.upper() in {"IID", "#IID"}:
-                    continue
-                sample_ids.append(token)
+            first = parts[0]
+
+            # Recognize common headers and pin the IID column for the rest of the file.
+            if first.upper() in {"IID", "#IID"}:
+                iid_col = 0
+                continue
+            if len(parts) >= 2 and first.upper() in {"FID", "#FID"} and parts[1].upper() == "IID":
+                iid_col = 1
+                continue
+            if raw.startswith("#"):
                 continue
 
-            first, second = parts[0], parts[1]
-            if first.upper() == "FID" and second.upper() == "IID":
+            if len(parts) == 1:
+                sample_ids.append(first)
                 continue
-            sample_ids.append(second)
+
+            if iid_col is None:
+                iid_col = 1
+            if iid_col >= len(parts):
+                raise ValueError(f"no IID column {iid_col} found in row for {p}: {raw}")
+            sample_ids.append(parts[iid_col])
 
     if not sample_ids:
         raise ValueError(f"no sample IDs parsed from {p}")
