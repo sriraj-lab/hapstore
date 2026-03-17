@@ -25,6 +25,8 @@ from ._internal._ingest_readers import (
     _coerce_ref_alt,
     _coerce_vid,
     _extract_vcf_arrays,
+    _extract_vcf_arrays_cyvcf2,
+    _extract_vcf_arrays_pysam,
     _resolve_subset,
 )
 from ._internal._ingest_sharding import (
