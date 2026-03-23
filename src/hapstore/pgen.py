@@ -834,7 +834,7 @@ def _ingest_pgen_parallel(
             output_store=output_zarr,
             chrom=chrom_key,
             axis="variants",
-            n_workers=min(int(workers), len(shard_store_paths)),
+            n_workers=1,
             chunk_variant_size=int(chunk_variant_size),
             chunk_haplotype_size=chunk_haplotype_size,
             chunk_sample_size=chunk_sample_size,

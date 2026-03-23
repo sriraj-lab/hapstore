@@ -142,6 +142,129 @@ class _OutputChunkTask:
     overlaps: tuple[tuple[Path, int, int, int, int], ...]
 
 
+def _codec_config(codec: Any) -> Any:
+    if codec is None:
+        return None
+    if hasattr(codec, "get_config"):
+        return codec.get_config()
+    return repr(codec)
+
+
+def _filters_config(filters: Any) -> Any:
+    if filters is None:
+        return None
+    return [_codec_config(filt) for filt in filters]
+
+
+def _arrays_support_direct_chunk_copy(src_arr: Any, out_arr: Any) -> bool:
+    return (
+        tuple(src_arr.chunks) == tuple(out_arr.chunks)
+        and np.dtype(src_arr.dtype) == np.dtype(out_arr.dtype)
+        and getattr(src_arr, "order", "C") == getattr(out_arr, "order", "C")
+        and _codec_config(getattr(src_arr, "compressor", None))
+        == _codec_config(getattr(out_arr, "compressor", None))
+        and _filters_config(getattr(src_arr, "filters", None))
+        == _filters_config(getattr(out_arr, "filters", None))
+        and getattr(src_arr, "fill_value", None) == getattr(out_arr, "fill_value", None)
+        and getattr(src_arr, "chunk_store", None) is not None
+        and getattr(out_arr, "chunk_store", None) is not None
+    )
+
+
+def _copy_raw_haplotype_chunks(
+    *,
+    src_arr: Any,
+    out_arr: Any,
+    src_chunk_index: int,
+    out_chunk_index: int,
+) -> None:
+    n_var_chunks = int((int(src_arr.shape[1]) + int(src_arr.chunks[1]) - 1) // int(src_arr.chunks[1]))
+    for var_chunk_index in range(n_var_chunks):
+        src_key = src_arr._chunk_key((int(src_chunk_index), int(var_chunk_index)))
+        out_key = out_arr._chunk_key((int(out_chunk_index), int(var_chunk_index)))
+        if src_key in src_arr.chunk_store:
+            out_arr.chunk_store[out_key] = src_arr.chunk_store[src_key]
+
+
+def _try_direct_copy_source_chunks(
+    *,
+    src_haps: Any,
+    out_haps: Any,
+    out_hap_offset: int,
+    src_n_haps: int,
+    store_genotypes: bool,
+    logger: logging.Logger,
+) -> bool:
+    if store_genotypes or not _arrays_support_direct_chunk_copy(src_haps, out_haps):
+        return False
+
+    hap_chunk = int(src_haps.chunks[0])
+    if hap_chunk <= 0:
+        return False
+    if int(src_n_haps) % hap_chunk != 0:
+        return False
+    if int(out_hap_offset) % hap_chunk != 0:
+        return False
+
+    src_chunk0 = 0
+    out_chunk0 = int(out_hap_offset) // hap_chunk
+    n_chunks = int(src_n_haps) // hap_chunk
+    logger.info(
+        "COPY_FASTPATH axis=samples mode=source_chunks out_hap_offset=%d n_hap_chunks=%d",
+        int(out_hap_offset),
+        int(n_chunks),
+    )
+    for delta in range(n_chunks):
+        _copy_raw_haplotype_chunks(
+            src_arr=src_haps,
+            out_arr=out_haps,
+            src_chunk_index=int(src_chunk0 + delta),
+            out_chunk_index=int(out_chunk0 + delta),
+        )
+    return True
+
+
+def _try_direct_copy_output_hap_chunk(
+    *,
+    src_haps: Any,
+    out_haps: Any,
+    out_h0: int,
+    out_h1: int,
+    src_local0: int,
+    src_local1: int,
+    store_genotypes: bool,
+    logger: logging.Logger,
+) -> bool:
+    if store_genotypes or not _arrays_support_direct_chunk_copy(src_haps, out_haps):
+        return False
+
+    hap_chunk = int(src_haps.chunks[0])
+    out_chunk = int(out_haps.chunks[0])
+    block_haps = int(out_h1) - int(out_h0)
+    src_block_haps = int(src_local1) - int(src_local0)
+    if block_haps != src_block_haps:
+        return False
+    if block_haps != out_chunk or src_block_haps != hap_chunk:
+        return False
+    if int(out_h0) % out_chunk != 0 or int(src_local0) % hap_chunk != 0:
+        return False
+
+    out_chunk_index = int(out_h0) // out_chunk
+    src_chunk_index = int(src_local0) // hap_chunk
+    logger.info(
+        "COPY_FASTPATH axis=samples mode=output_hap_chunk out_hap_offset=%d out_hap_end=%d",
+        int(out_h0),
+        int(out_h1),
+    )
+    _copy_raw_haplotype_chunks(
+        src_arr=src_haps,
+        out_arr=out_haps,
+        src_chunk_index=src_chunk_index,
+        out_chunk_index=out_chunk_index,
+    )
+    return True
+
+
 def _copy_dense_matrices_parallel_by_output_hap_chunks(
     *,
     out_path: Path,
@@ -256,6 +379,20 @@ def _worker_copy_output_hap_chunk(
         len(sources),
     )
 
+    if len(overlaps) == 1:
+        src_path, _out_local0, _out_local1, src_local0, src_local1 = overlaps[0]
+        if _try_direct_copy_output_hap_chunk(
+            src_haps=src_haps[src_path],
+            out_haps=out_haps,
+            out_h0=int(out_h0),
+            out_h1=int(out_h1),
+            src_local0=int(src_local0),
+            src_local1=int(src_local1),
+            store_genotypes=("genotypes" in out_group),
+            logger=logger,
+        ):
+            return
+
     for v0 in range(0, n_vars, int(variant_chunk)):
         v1 = min(int(v0) + int(variant_chunk), n_vars)
         block = np.empty((block_haps, int(v1) - int(v0)), dtype=np.uint8)
@@ -337,6 +474,17 @@ def _worker_copy_source(
     )
 
     if axis == "samples":
+        if _try_direct_copy_source_chunks(
+            src_haps=src_haps,
+            out_haps=out_haps,
+            out_hap_offset=int(out_hap_offset),
+            src_n_haps=int(src_n_haps),
+            store_genotypes=bool(store_genotypes),
+            logger=logger,
+        ):
+            logger.info("COPY_DONE source=%s axis=%s", str(source_path), axis)
+            return
+
         for h0 in range(0, src_n_haps, hap_chunk):
             h1 = min(h0 + hap_chunk, src_n_haps)
             out_h0 = out_hap_offset + h0

@@ -9,7 +9,7 @@ import numpy as np
 
 from hapstore.store import _MISSING_SENTINEL
 
-Backend = Literal["auto", "cyvcf2", "pysam", "text"]
+Backend = Literal["auto", "cyvcf2", "pysam", "text", "plink2_bridge"]
 MissingRefAltPolicy = Literal["error", "dot"]
 MissingVidPolicy = Literal["dot", "error"]
 UnphasedPolicy = Literal["missing", "error"]

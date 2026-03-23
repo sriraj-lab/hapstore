@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -18,8 +19,9 @@ import numpy as np
 import zarr
 from numcodecs import VLenUTF8, Zstd
 
-from hapstore.chrom import normalize_chrom
+from hapstore.chrom import candidate_contigs, normalize_chrom
 
+from ._internal.command import CommandExecutionError, run_cmd
 from ._internal._ingest_index import _has_tabix_index
 from ._internal._ingest_readers import (
     _coerce_ref_alt,
@@ -58,6 +60,7 @@ from ._internal.ingest_models import (
     _ShardSpec,
     _StreamingFinalizeContext,
 )
+from ._internal.plink import resolve_plink2_binary
 from .store import HapStore
 
 logger = logging.getLogger(__name__)
@@ -147,6 +150,160 @@ def _build_ingest_attrs_payload(
     if partition_seconds is not None:
         payload["partition_seconds"] = float(partition_seconds)
     return payload
+
+
+def _bridge_backend_supported(
+    *,
+    on_missing_ref_alt: MissingRefAltPolicy,
+    on_missing_vid: MissingVidPolicy,
+) -> bool:
+    return on_missing_ref_alt == "error" and on_missing_vid == "dot"
+
+
+def _write_genetic_positions_to_store(
+    *,
+    output_zarr: str | Path,
+    chrom: str | int,
+    genetic_positions: np.ndarray,
+) -> HapStore:
+    store = HapStore(output_zarr, mode="a")
+    chrom_key = normalize_chrom(chrom, prefix=True)
+    chrom_group = store.root[chrom_key]
+    variants_group = chrom_group["variants"]
+    if "genetic_pos" in variants_group:
+        del variants_group["genetic_pos"]
+
+    pos_arr = variants_group["pos"]
+    chunk_shape = pos_arr.chunks or (int(genetic_positions.shape[0]),)
+    variants_group.create_dataset(
+        "genetic_pos",
+        data=np.asarray(genetic_positions, dtype=np.float64),
+        dtype=np.float64,
+        chunks=chunk_shape,
+        compressor=pos_arr.compressor,
+        overwrite=False,
+    )
+    return store
+
+
+def _run_plink2_vcf_to_pgen(
+    *,
+    vcf_path: Path,
+    chrom: str | int,
+    out_prefix: Path,
+    workers: int,
+) -> tuple[Path, str]:
+    plink2_bin = resolve_plink2_binary("plink2")
+    failures: list[str] = []
+    for contig in candidate_contigs(chrom):
+        for suffix in (".pgen", ".pvar", ".psam", ".log"):
+            out_prefix.with_suffix(suffix).unlink(missing_ok=True)
+        cmd = [
+            str(plink2_bin),
+            "--vcf",
+            str(vcf_path),
+            "--allow-extra-chr",
+            "--chr",
+            str(contig),
+            "--max-alleles",
+            "2",
+            "--make-pgen",
+            "--out",
+            str(out_prefix),
+            "--threads",
+            str(int(max(1, workers))),
+        ]
+        try:
+            run_cmd(cmd)
+        except CommandExecutionError as exc:
+            failures.append(exc.result.stderr or exc.result.stdout or str(exc))
+            continue
+
+        prefix = out_prefix
+        if prefix.with_suffix(".pgen").exists() and prefix.with_suffix(".pvar").exists() and prefix.with_suffix(".psam").exists():
+            return prefix, str(contig)
+        failures.append(f"plink2 completed without writing a full PGEN triplet for contig {contig!r}")
+
+    joined = "\n---\n".join(text.strip() for text in failures if text.strip())
+    raise RuntimeError(
+        f"plink2 bridge failed to create a chromosome-restricted PGEN for {vcf_path} "
+        f"chrom={normalize_chrom(chrom, prefix=True)!r}.\n{joined}"
+    )
+
+
+def _ingest_vcf_via_plink2_bridge(
+    *,
+    vcf_path: Path,
+    output_zarr: str | Path,
+    chrom: str | int,
+    genetic_map_path: str | Path | None,
+    sample_ids: list[str] | None,
+    chunk_variant_size: int,
+    chunk_haplotype_size: int | None,
+    chunk_sample_size: int | None,
+    compression_level: int,
+    store_genotypes: bool,
+    attrs: dict | None,
+    on_missing_ref_alt: MissingRefAltPolicy,
+    on_missing_vid: MissingVidPolicy,
+    on_unphased_gt: UnphasedPolicy,
+    workers: int,
+) -> HapStore:
+    if not _bridge_backend_supported(
+        on_missing_ref_alt=on_missing_ref_alt,
+        on_missing_vid=on_missing_vid,
+    ):
+        raise ValueError(
+            "plink2_bridge only supports on_missing_ref_alt='error' and on_missing_vid='dot'"
+        )
+
+    scratch_root = Path(
+        tempfile.mkdtemp(
+            prefix=f"{vcf_path.stem}.plink2_ingest_",
+            dir=str(Path(output_zarr).resolve().parent),
+        )
+    )
+    bridge_prefix = scratch_root / "bridge"
+    try:
+        pgen_prefix, _resolved_contig = _run_plink2_vcf_to_pgen(
+            vcf_path=vcf_path,
+            chrom=chrom,
+            out_prefix=bridge_prefix,
+            workers=int(workers),
+        )
+        from . import pgen as pgen_mod
+
+        attrs_payload = dict(attrs or {})
+        attrs_payload.setdefault("source", "vcf")
+        attrs_payload["ingest_backend"] = "plink2_bridge"
+        store = pgen_mod.ingest_pgen(
+            pgen_prefix=pgen_prefix,
+            output_zarr=output_zarr,
+            chrom=chrom,
+            sample_ids=sample_ids,
+            on_unphased_gt=on_unphased_gt,
+            workers=int(workers),
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=int(compression_level),
+            store_genotypes=bool(store_genotypes),
+            attrs=attrs_payload,
+        )
+
+        map_df = _load_genetic_map_df(genetic_map_path, chrom=chrom)
+        if map_df is not None:
+            positions = store.variant_positions(chrom)
+            genetic_positions = _interpolate_genetic_positions(positions, map_df=map_df, chrom=chrom)
+            if genetic_positions is not None:
+                store = _write_genetic_positions_to_store(
+                    output_zarr=output_zarr,
+                    chrom=chrom,
+                    genetic_positions=genetic_positions,
+                )
+        return store
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
 
 
 def _single_shard_store_from_extract(
@@ -344,7 +501,7 @@ def ingest_vcf(
     chunk_sample_size: int | None = None,
     compression_level: int = 3,
     store_genotypes: bool = False,
-    backend: Backend = "cyvcf2",
+    backend: Backend = "auto",
     attrs: dict | None = None,
     on_missing_ref_alt: MissingRefAltPolicy = "error",
     on_missing_vid: MissingVidPolicy = "dot",
@@ -382,6 +539,52 @@ def ingest_vcf(
 
     if int(workers) > 1:
         _warn_reader_worker_budget(int(workers), backend)
+
+    if backend == "auto":
+        if _bridge_backend_supported(
+            on_missing_ref_alt=on_missing_ref_alt,
+            on_missing_vid=on_missing_vid,
+        ):
+            try:
+                return _ingest_vcf_via_plink2_bridge(
+                    vcf_path=vcf,
+                    output_zarr=output_zarr,
+                    chrom=chrom,
+                    genetic_map_path=genetic_map_path,
+                    sample_ids=sample_ids,
+                    chunk_variant_size=chunk_variant_size,
+                    chunk_haplotype_size=chunk_haplotype_size,
+                    chunk_sample_size=chunk_sample_size,
+                    compression_level=compression_level,
+                    store_genotypes=store_genotypes,
+                    attrs=attrs,
+                    on_missing_ref_alt=on_missing_ref_alt,
+                    on_missing_vid=on_missing_vid,
+                    on_unphased_gt=on_unphased_gt,
+                    workers=int(workers),
+                )
+            except (FileNotFoundError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+                logger.info("plink2 bridge unavailable for %s; falling back to cyvcf2 (%s)", vcf, exc)
+        backend = "cyvcf2"
+
+    if backend == "plink2_bridge":
+        return _ingest_vcf_via_plink2_bridge(
+            vcf_path=vcf,
+            output_zarr=output_zarr,
+            chrom=chrom,
+            genetic_map_path=genetic_map_path,
+            sample_ids=sample_ids,
+            chunk_variant_size=chunk_variant_size,
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=compression_level,
+            store_genotypes=store_genotypes,
+            attrs=attrs,
+            on_missing_ref_alt=on_missing_ref_alt,
+            on_missing_vid=on_missing_vid,
+            on_unphased_gt=on_unphased_gt,
+            workers=int(workers),
+        )
 
     if backend == "pysam" and int(workers) > 1:
         return _ingest_vcf_pysam_staged(

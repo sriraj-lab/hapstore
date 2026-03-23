@@ -111,6 +111,43 @@ def test_concat_samples_parallel_equals_serial(tmp_path, synthetic_arrays):
     assert a.sample_ids("chr21") == b.sample_ids("chr21")
 
 
+def test_concat_samples_direct_chunk_copy_logs_fastpath(tmp_path, synthetic_arrays, caplog):
+    left, right = _split_fixture_arrays(synthetic_arrays)
+    s1 = ingest_arrays(
+        output_zarr=tmp_path / "left_fast.zarr",
+        chrom="chr21",
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        compression_level=3,
+        **left,
+    )
+    s2 = ingest_arrays(
+        output_zarr=tmp_path / "right_fast.zarr",
+        chrom="chr21",
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        compression_level=3,
+        **right,
+    )
+
+    caplog.set_level("INFO")
+    concat_hapstores(
+        input_stores=[s1.path, s2.path],
+        output_store=tmp_path / "fast_concat.zarr",
+        chrom="chr21",
+        axis="samples",
+        validate="spot",
+        n_workers=1,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        compression_level=3,
+        store_genotypes=False,
+        overwrite=False,
+    )
+
+    assert "COPY_FASTPATH axis=samples mode=source_chunks" in caplog.text
+
+
 def test_concat_variants_roundtrip(tmp_path):
     sample_ids = np.asarray(["s1", "s2"], dtype=object)
     pops = np.asarray(["P1", "P1"], dtype=object)
@@ -253,4 +290,3 @@ def test_overwrite_and_tmp_suffix_behavior(tmp_path, synthetic_arrays):
         validate="spot",
         overwrite=True,
     )
-

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import hapstore.ingest as ingest_mod
+import hapstore.pgen as pgen_mod
 from hapstore import HapStore, ingest_arrays, ingest_vcf
 
 from .conftest import write_genetic_map, write_text_vcf
@@ -220,6 +222,135 @@ def test_ingest_vcf_missing_variant_info_policies(tmp_path):
     assert extra["missing_ref_count"] == 1
     assert extra["missing_alt_count"] == 1
     assert extra["missing_vid_count"] == 2
+
+
+def test_ingest_vcf_auto_prefers_plink2_bridge(tmp_path, monkeypatch):
+    vcf = write_text_vcf(
+        tmp_path / "auto_bridge.vcf",
+        rows=[
+            ("chr1", 100, "rs1", "A", "G", ["0|1", "1|1"]),
+        ],
+    )
+    called = {"bridge": False}
+
+    def fake_bridge(**kwargs):
+        called["bridge"] = True
+        return ingest_arrays(
+            output_zarr=kwargs["output_zarr"],
+            chrom=kwargs["chrom"],
+            haplotypes=np.asarray([[0], [1], [1], [1]], dtype=np.uint8),
+            variant_pos=np.asarray([100], dtype=np.int64),
+            sample_ids=["s1", "s2"],
+            ref=["A"],
+            alt=["G"],
+            vid=["rs1"],
+            attrs={"source": "vcf", "ingest_backend": "plink2_bridge"},
+        )
+
+    monkeypatch.setattr(ingest_mod, "_ingest_vcf_via_plink2_bridge", fake_bridge)
+    monkeypatch.setattr(
+        ingest_mod,
+        "_extract_vcf_arrays",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("direct VCF parser should not run")),
+    )
+
+    store = ingest_vcf(vcf_path=vcf, output_zarr=tmp_path / "auto_bridge.zarr", chrom="1")
+
+    assert called["bridge"] is True
+    assert store.attrs("1")["source"] == "vcf"
+    assert store.attrs("1")["extra"]["ingest_backend"] == "plink2_bridge"
+
+
+def test_ingest_vcf_auto_falls_back_when_bridge_unavailable(tmp_path, monkeypatch):
+    vcf = write_text_vcf(
+        tmp_path / "auto_fallback.vcf",
+        rows=[
+            ("chr1", 100, "rs1", "A", "G", ["0|1", "1|1"]),
+        ],
+    )
+
+    monkeypatch.setattr(
+        ingest_mod,
+        "_ingest_vcf_via_plink2_bridge",
+        lambda **kwargs: (_ for _ in ()).throw(FileNotFoundError("plink2 missing")),
+    )
+
+    def fake_extract(**kwargs):
+        return ingest_mod._IngestArrays(
+            haplotypes=np.asarray([[0], [1], [1], [1]], dtype=np.uint8),
+            positions=np.asarray([100], dtype=np.int64),
+            ref=np.asarray(["A"], dtype=object),
+            alt=np.asarray(["G"], dtype=object),
+            vid=np.asarray(["rs1"], dtype=object),
+            sample_ids=np.asarray(["s1", "s2"], dtype=object),
+            missing_ref_count=0,
+            missing_alt_count=0,
+            missing_vid_count=0,
+            unphased_gt_count=0,
+        )
+
+    monkeypatch.setattr(ingest_mod, "_extract_vcf_arrays", fake_extract)
+
+    store = ingest_vcf(vcf_path=vcf, output_zarr=tmp_path / "auto_fallback.zarr", chrom="1")
+
+    assert store.n_variants("1") == 1
+    assert store.attrs("1").get("source") is None
+
+
+def test_ingest_vcf_plink2_bridge_backfills_genetic_positions(tmp_path, monkeypatch):
+    vcf = write_text_vcf(
+        tmp_path / "bridge.vcf",
+        rows=[
+            ("chr1", 100, "rs1", "A", "G", ["0|1", "1|1"]),
+            ("chr1", 200, "rs2", "C", "T", ["0|0", "0|1"]),
+        ],
+    )
+    gmap = write_genetic_map(
+        tmp_path / "bridge_map.tsv",
+        chrom="1",
+        positions=[100, 200],
+        cms=[0.10, 0.30],
+    )
+
+    monkeypatch.setattr(ingest_mod, "resolve_plink2_binary", lambda _: Path("/mock/plink2"))
+
+    def fake_run_cmd(cmd, **kwargs):
+        out_prefix = Path(cmd[cmd.index("--out") + 1])
+        for suffix in (".pgen", ".pvar", ".psam", ".log"):
+            out_prefix.with_suffix(suffix).touch()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ingest_mod, "run_cmd", fake_run_cmd)
+
+    def fake_ingest_pgen(**kwargs):
+        return ingest_arrays(
+            output_zarr=kwargs["output_zarr"],
+            chrom=kwargs["chrom"],
+            haplotypes=np.asarray([[0, 0], [1, 0], [1, 0], [1, 1]], dtype=np.uint8),
+            variant_pos=np.asarray([100, 200], dtype=np.int64),
+            sample_ids=["s1", "s2"],
+            ref=["A", "C"],
+            alt=["G", "T"],
+            vid=["rs1", "rs2"],
+            attrs=kwargs["attrs"],
+        )
+
+    monkeypatch.setattr(pgen_mod, "ingest_pgen", fake_ingest_pgen)
+
+    store = ingest_vcf(
+        vcf_path=vcf,
+        output_zarr=tmp_path / "bridge.zarr",
+        chrom="1",
+        backend="plink2_bridge",
+        genetic_map_path=gmap,
+    )
+
+    np.testing.assert_allclose(
+        store.genetic_positions("1"),
+        np.asarray([0.10, 0.30], dtype=float),
+    )
+    assert store.attrs("1")["source"] == "vcf"
+    assert store.attrs("1")["extra"]["ingest_backend"] == "plink2_bridge"
 
 
 def test_ingest_arrays_roundtrip_and_missing_attr(tmp_path, synthetic_arrays):
