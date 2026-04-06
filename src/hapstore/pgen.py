@@ -225,6 +225,19 @@ def _export_pgen_single(
     vid_ds = variants["vid"]
     n_variants = int(pos_ds.shape[0])
 
+    # Force block size to a multiple of zarr chunk size for efficient reads
+    chunk_variant_size = int(store.attrs(chrom_key).get("chunk_variant_size", 500) or 500)
+    if chunk_variant_size > 0:
+        original_block_size = int(variant_block_size)
+        aligned = max(chunk_variant_size, (original_block_size // chunk_variant_size) * chunk_variant_size)
+        if aligned != original_block_size:
+            import logging
+            logging.getLogger(__name__).info(
+                "export_pgen: variant_block_size %d rounded down to %d (multiple of chunk_variant_size=%d)",
+                original_block_size, aligned, chunk_variant_size,
+            )
+            variant_block_size = aligned
+
     selected_indices = _resolve_export_variant_indices(
         store=store,
         chrom_key=chrom_key,
@@ -246,6 +259,12 @@ def _export_pgen_single(
         psam_handle.write("#FID\tIID\tPAT\tMAT\tSEX\tPHENO\n")
         for sid in sample_plan.selected_sample_ids:
             psam_handle.write(f"0\t{sid}\t0\t0\t0\t-9\n")
+
+    # Pre-load all variant metadata once to avoid per-block zarr reads
+    all_pos = np.asarray(pos_ds[:], dtype=np.int64)
+    all_ref = _to_unicode_array(np.asarray(ref_ds[:], dtype=object))
+    all_alt = _to_unicode_array(np.asarray(alt_ds[:], dtype=object))
+    all_vid = _to_unicode_array(np.asarray(vid_ds[:], dtype=object))
 
     written = 0
     with pvar_path.open("w", encoding="utf-8") as pvar_handle:
@@ -276,10 +295,10 @@ def _export_pgen_single(
                     strict_biallelic=bool(strict_biallelic),
                 )
 
-                pos_block = np.asarray(pos_ds[start:stop], dtype=np.int64)
-                ref_block = _to_unicode_array(np.asarray(ref_ds[start:stop], dtype=object)).tolist()
-                alt_block = _to_unicode_array(np.asarray(alt_ds[start:stop], dtype=object)).tolist()
-                vid_block = _to_unicode_array(np.asarray(vid_ds[start:stop], dtype=object)).tolist()
+                pos_block = all_pos[start:stop]
+                ref_block = all_ref[start:stop].tolist()
+                alt_block = all_alt[start:stop].tolist()
+                vid_block = all_vid[start:stop].tolist()
 
                 allele_batch = np.ascontiguousarray(hap_block.T.astype(np.int32, copy=False))
                 allele_batch[allele_batch == int(_MISSING_SENTINEL)] = -9

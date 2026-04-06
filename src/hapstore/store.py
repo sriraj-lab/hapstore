@@ -315,6 +315,18 @@ class HapStore:
             return np.asarray(arr[:, variant_sel], dtype=np.uint8)
 
         mask = _validate_sample_mask(sample_mask, self.n_samples(chrom))
+        n_selected = int(np.count_nonzero(mask))
+        n_total = int(mask.shape[0])
+
+        # When selecting >50% of samples, contiguous read + numpy mask is faster
+        # than zarr oindex fancy indexing which does per-chunk random access.
+        if n_total > 0 and n_selected > n_total // 2:
+            full = np.asarray(arr[:, variant_sel], dtype=np.uint8)
+            hap_mask = np.empty(full.shape[0], dtype=bool)
+            hap_mask[0::2] = mask
+            hap_mask[1::2] = mask
+            return full[hap_mask]
+
         sample_indices = np.flatnonzero(mask)
         hap_indices = np.empty(sample_indices.size * 2, dtype=np.int64)
         hap_indices[0::2] = 2 * sample_indices
@@ -334,6 +346,11 @@ class HapStore:
             if sample_mask is None:
                 return np.asarray(chrom_group["genotypes"][:, variant_sel], dtype=np.uint8)
             mask = _validate_sample_mask(sample_mask, self.n_samples(chrom))
+            n_selected = int(np.count_nonzero(mask))
+            n_total = int(mask.shape[0])
+            if n_total > 0 and n_selected > n_total // 2:
+                full = np.asarray(chrom_group["genotypes"][:, variant_sel], dtype=np.uint8)
+                return full[mask]
             sample_indices = np.flatnonzero(mask)
             return np.asarray(chrom_group["genotypes"].oindex[sample_indices, variant_sel], dtype=np.uint8)
 
