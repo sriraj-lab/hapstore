@@ -29,6 +29,8 @@ pip install -e ".[dev,pgen]"
 Core store:
 
 - `hapstore.HapStore`
+- `hapstore.HapStoreDosageRequest`
+- `hapstore.HapStoreDosageBatch`
 
 Ingest:
 
@@ -130,6 +132,36 @@ export_pgen(
 - Variant-axis concat requires identical sample IDs and order across inputs.
 - Parallel staged VCF ingest requires indexed input (`.tbi` or `.csi`).
 - `export_vcf(..., plink2_location=...)` uses the `HapStore -> PGEN -> VCF` bridge.
+
+## Reader performance notes
+
+Repeated downstream window extraction should avoid many small random variant reads. For large local-window workloads, use the core dosage reader instead of reimplementing chunk planning in downstream scripts:
+
+```python
+from hapstore import HapStore, HapStoreDosageRequest
+
+store = HapStore("panel.chr1.hapstore.zarr", mode="r")
+
+dosages = store.read_dosages(
+    "1",
+    variant_ids=["rs1", "rs2", "rs3"],
+    dtype="float32",
+    workers="auto",
+)
+
+batch = store.read_dosage_batch(
+    "1",
+    [
+        HapStoreDosageRequest("w1", variant_ids=["rs1", "rs2"]),
+        HapStoreDosageRequest("w2", variant_ids=["rs2", "rs3"]),
+    ],
+    workers="auto",
+)
+w1_matrix = batch.window_matrix("w1")
+w1_score = batch.project("w1", weights=[0.2, -0.1])
+```
+
+`read_dosages` groups requested variants and sample rows by native zarr chunks, coalesces adjacent dense chunks into larger production-oriented tiles, opens one read handle per worker, reads 2D row-by-variant tiles concurrently, and returns columns in request order. If a stored `genotypes` array exists, it reads that array directly; otherwise it sums paired haplotypes tile-by-tile. Stores with `has_missing=false` skip missing-sentinel scans by default. `workers="auto"` uses a chunk-grid-aware worker policy capped at 8 workers by default; set `HAPSTORE_READ_AUTO_MAX_WORKERS` to tune the cap or `HAPSTORE_READ_WORKERS` to force a worker count for benchmarking. Contiguous-batch tile coalescing defaults to `4` variant chunks by `2` sample chunks; tune with `HAPSTORE_READ_VARIANT_GROUP_CHUNKS`, `HAPSTORE_READ_SAMPLE_GROUP_CHUNKS`, and `HAPSTORE_READ_COALESCE_MIN_DENSITY`. Use `workers=1` or `backend="serial"` to opt out of threaded tile reads.
 
 ## Relationship to forgephast
 

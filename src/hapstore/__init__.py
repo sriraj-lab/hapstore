@@ -7,11 +7,13 @@ from .ingest import ingest_arrays, ingest_vcf
 from .ids import align_by_ids, ensure_id_column, read_sample_ids
 from .pgen import export_pgen, ingest_pgen
 from .seeding import stable_seed
-from .store import HapStore
+from .store import HapStore, HapStoreDosageBatch, HapStoreDosageRequest
 from .windows import compute_window_boundaries, compute_window_midpoints
 
 __all__ = [
     "HapStore",
+    "HapStoreDosageBatch",
+    "HapStoreDosageRequest",
     "ingest_vcf",
     "ingest_arrays",
     "concat_hapstores",

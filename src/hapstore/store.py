@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Hashable, Iterator, Sequence
 
 import numpy as np
 import zarr
@@ -17,6 +22,49 @@ from .windows import compute_window_boundaries, compute_window_midpoints
 
 _MISSING_SENTINEL = 255
 _SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class HapStoreDosageRequest:
+    """One named dosage request for a shared chromosome read."""
+
+    request_id: Hashable
+    variant_ids: Sequence[str] | None = None
+    variant_indices: Sequence[int] | np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class HapStoreDosageBatch:
+    """Shared union dosage matrix plus per-request column maps."""
+
+    matrix: np.ndarray
+    variant_indices: np.ndarray
+    request_columns: dict[Hashable, np.ndarray]
+    request_ids: tuple[Hashable, ...]
+    variant_ids: tuple[str, ...] | None = None
+    metrics: dict[str, Any] | None = None
+
+    def window_matrix(self, request_id: Hashable) -> np.ndarray:
+        cols = self.request_columns[request_id]
+        return np.asarray(self.matrix[:, cols], dtype=self.matrix.dtype)
+
+    def project(self, request_id: Hashable, weights: np.ndarray) -> np.ndarray:
+        cols = self.request_columns[request_id]
+        w = np.asarray(weights, dtype=self.matrix.dtype)
+        if w.ndim != 1 or w.shape[0] != cols.shape[0]:
+            raise ValueError(
+                f"weights for request {request_id!r} must have shape ({cols.shape[0]},), "
+                f"got {w.shape}"
+            )
+        return np.asarray(self.matrix[:, cols] @ w, dtype=self.matrix.dtype)
+
+
+@dataclass(frozen=True)
+class _ReadGroup:
+    start: int
+    stop: int
+    offsets: np.ndarray
+    out_positions: np.ndarray
 
 
 class HapStore:
@@ -33,6 +81,8 @@ class HapStore:
             raise FileNotFoundError(f"hapstore path does not exist: {self._path}")
 
         self._root = zarr.open(str(self._path), mode=mode)
+        self._variant_index_cache: dict[str, dict[str, int]] = {}
+        self._last_read_metrics: dict[str, Any] = {}
         if mode in {"a", "w"}:
             if "format" not in self._root.attrs:
                 self._root.attrs["format"] = "hapstore"
@@ -50,6 +100,10 @@ class HapStore:
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def last_read_metrics(self) -> dict[str, Any]:
+        return dict(self._last_read_metrics)
 
     def _chrom_key(self, chrom: str | int) -> str:
         return normalize_chrom(chrom, prefix=True)
@@ -357,6 +411,275 @@ class HapStore:
         haps = self.haplotypes(chrom, variant_slice=variant_sel, sample_mask=sample_mask)
         return _haplotypes_to_genotypes(haps)
 
+    def read_dosages(
+        self,
+        chrom: str | int,
+        *,
+        variant_ids: Sequence[str] | None = None,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        dtype: str | np.dtype = "float32",
+        missing: str = "nan",
+        workers: int | str = "auto",
+        backend: str = "auto",
+        assume_no_missing: bool = False,
+    ) -> np.ndarray:
+        """Read dosages with chunk-aware threaded 2D tiling.
+
+        Output columns follow the requested variant order. ``workers=1`` or
+        ``backend="serial"`` preserves the historical contiguous-span read path.
+        """
+        chrom_group = self._require_chromosome(chrom)
+        variant_idx = self._resolve_variant_indices(
+            chrom=chrom,
+            variant_ids=variant_ids,
+            variant_indices=variant_indices,
+        )
+        sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
+        if variant_idx.size == 0:
+            return np.empty((sample_idx.size, 0), dtype=np.dtype(dtype))
+        target_dtype = np.dtype(dtype)
+        missing_mode = _normalize_missing_mode(missing)
+        if missing_mode == "nan" and not np.issubdtype(target_dtype, np.floating):
+            raise ValueError("missing='nan' requires a floating dtype")
+
+        backend_name = str(backend).lower()
+        if backend_name not in {"auto", "threaded", "serial"}:
+            raise ValueError(f"backend must be one of auto/threaded/serial, got {backend!r}")
+        if _is_explicit_single_worker(workers):
+            explicit_single_worker = True
+        else:
+            explicit_single_worker = False
+        if backend_name == "serial" or explicit_single_worker:
+            return self._read_dosages_serial(
+                chrom=chrom,
+                variant_indices=variant_idx,
+                sample_indices=sample_idx,
+                dtype=target_dtype,
+                missing=missing_mode,
+                assume_no_missing=assume_no_missing,
+            )
+
+        arr_name = "genotypes" if "genotypes" in chrom_group else "haplotypes"
+        arr = chrom_group[arr_name]
+        attrs = self.attrs(chrom)
+        has_missing = bool(attrs.get("has_missing", True)) and not bool(assume_no_missing)
+        variant_chunk = int(arr.chunks[1])
+        if arr_name == "genotypes":
+            row_chunk = int(arr.chunks[0])
+        else:
+            row_chunk = max(1, int(arr.chunks[0]) // 2)
+        variant_groups = _make_read_groups(variant_idx, chunk_size=variant_chunk, limit=int(self.n_variants(chrom)))
+        sample_groups = _make_read_groups(sample_idx, chunk_size=row_chunk, limit=int(self.n_samples(chrom)))
+        native_variant_groups = len(variant_groups)
+        native_sample_groups = len(sample_groups)
+        variant_group_chunks, variant_group_source = _env_positive_int(
+            ("HAPSTORE_READ_VARIANT_GROUP_CHUNKS",),
+            default=4,
+        )
+        sample_group_chunks, sample_group_source = _env_positive_int(
+            ("HAPSTORE_READ_SAMPLE_GROUP_CHUNKS",),
+            default=2,
+        )
+        min_density, min_density_source = _env_positive_float(
+            ("HAPSTORE_READ_COALESCE_MIN_DENSITY",),
+            default=0.25,
+        )
+        assert variant_group_chunks is not None
+        assert sample_group_chunks is not None
+        assert min_density is not None
+        variant_groups = _coalesce_read_groups(
+            variant_groups,
+            max_span=max(1, int(variant_chunk) * int(variant_group_chunks)),
+            max_gap=max(0, int(variant_chunk)),
+            min_density=float(min_density),
+        )
+        sample_groups = _coalesce_read_groups(
+            sample_groups,
+            max_span=max(1, int(row_chunk) * int(sample_group_chunks)),
+            max_gap=0,
+            min_density=float(min_density),
+        )
+        total_tasks = len(variant_groups) * len(sample_groups)
+        worker_count, worker_policy = _resolve_read_worker_count(
+            workers,
+            n_tasks=total_tasks,
+            n_sample_groups=len(sample_groups),
+            n_variant_groups=len(variant_groups),
+            n_samples=sample_idx.size,
+            n_variants=variant_idx.size,
+            row_chunk=row_chunk,
+            variant_chunk=variant_chunk,
+            dataset=arr_name,
+        )
+        out = np.empty((sample_idx.size, variant_idx.size), dtype=target_dtype)
+        local = threading.local()
+        path = str(self._path)
+        chrom_key = self._chrom_key(chrom)
+        read_sec = 0.0
+        convert_sec = 0.0
+        assign_sec = 0.0
+        total_start = time.perf_counter()
+
+        def read_tile(sample_group: _ReadGroup, variant_group: _ReadGroup) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+            if not hasattr(local, "root"):
+                local.root = zarr.open(path, mode="r")
+            local_arr = local.root[chrom_key][arr_name]
+            read_start = time.perf_counter()
+            if arr_name == "genotypes":
+                block = np.asarray(
+                    local_arr[
+                        int(sample_group.start) : int(sample_group.stop),
+                        int(variant_group.start) : int(variant_group.stop),
+                    ],
+                    dtype=np.uint8,
+                )
+            else:
+                block = np.asarray(
+                    local_arr[
+                        int(2 * sample_group.start) : int(2 * sample_group.stop),
+                        int(variant_group.start) : int(variant_group.stop),
+                    ],
+                    dtype=np.uint8,
+                )
+            tile_read_sec = time.perf_counter() - read_start
+            convert_start = time.perf_counter()
+            if arr_name == "genotypes":
+                values_u8 = block[np.ix_(sample_group.offsets, variant_group.offsets)]
+                values = _format_genotype_values(
+                    values_u8,
+                    dtype=target_dtype,
+                    missing=missing_mode,
+                    has_missing=has_missing,
+                )
+            else:
+                first = block[0::2, :]
+                second = block[1::2, :]
+                a = first[np.ix_(sample_group.offsets, variant_group.offsets)]
+                b = second[np.ix_(sample_group.offsets, variant_group.offsets)]
+                values = _format_haplotype_pair_values(
+                    a,
+                    b,
+                    dtype=target_dtype,
+                    missing=missing_mode,
+                    has_missing=has_missing,
+                )
+            tile_convert_sec = time.perf_counter() - convert_start
+            return sample_group.out_positions, variant_group.out_positions, values, tile_read_sec, tile_convert_sec
+
+        if total_tasks <= 1:
+            tasks = [
+                read_tile(sample_groups[0], variant_groups[0])
+            ]
+        else:
+            tasks = []
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hapstore-read") as pool:
+                futures = [
+                    pool.submit(read_tile, sample_group, variant_group)
+                    for sample_group in sample_groups
+                    for variant_group in variant_groups
+                ]
+                for future in as_completed(futures):
+                    tasks.append(future.result())
+        for out_rows, out_cols, values, tile_read_sec, tile_convert_sec in tasks:
+            read_sec += float(tile_read_sec)
+            convert_sec += float(tile_convert_sec)
+            assign_start = time.perf_counter()
+            out[np.ix_(out_rows, out_cols)] = values
+            assign_sec += time.perf_counter() - assign_start
+        self._last_read_metrics = {
+            "backend": "threaded",
+            "dataset": arr_name,
+            "requested_workers": str(workers),
+            "workers": int(worker_count),
+            **worker_policy,
+            "n_samples": int(sample_idx.size),
+            "n_variants": int(variant_idx.size),
+            "n_unique_variants": int(np.unique(variant_idx).size),
+            "row_chunk": int(row_chunk),
+            "variant_chunk": int(variant_chunk),
+            "native_sample_groups": int(native_sample_groups),
+            "native_variant_groups": int(native_variant_groups),
+            "sample_groups": int(len(sample_groups)),
+            "variant_groups": int(len(variant_groups)),
+            "sample_group_chunks": int(sample_group_chunks),
+            "sample_group_chunks_source": sample_group_source or "default",
+            "variant_group_chunks": int(variant_group_chunks),
+            "variant_group_chunks_source": variant_group_source or "default",
+            "coalesce_min_density": float(min_density),
+            "coalesce_min_density_source": min_density_source or "default",
+            "n_tiles": int(total_tasks),
+            "has_missing": bool(has_missing),
+            "assume_no_missing": bool(assume_no_missing),
+            "read_sec_sum": float(read_sec),
+            "convert_sec_sum": float(convert_sec),
+            "assign_sec": float(assign_sec),
+            "total_sec": float(time.perf_counter() - total_start),
+        }
+        return out
+
+    def read_dosage_batch(
+        self,
+        chrom: str | int,
+        requests: Sequence[HapStoreDosageRequest | dict[str, Any] | tuple[Hashable, Sequence[str] | Sequence[int] | np.ndarray]],
+        *,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        dtype: str | np.dtype = "float32",
+        missing: str = "nan",
+        workers: int | str = "auto",
+        backend: str = "auto",
+        assume_no_missing: bool = False,
+    ) -> HapStoreDosageBatch:
+        parsed = [self._normalize_dosage_request(chrom, request, i) for i, request in enumerate(requests)]
+        if not parsed:
+            sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
+            return HapStoreDosageBatch(
+                matrix=np.empty((sample_idx.size, 0), dtype=np.dtype(dtype)),
+                variant_indices=np.empty(0, dtype=np.int64),
+                request_columns={},
+                request_ids=(),
+                metrics={"backend": "empty"},
+            )
+        seen: set[int] = set()
+        union_indices: list[int] = []
+        for _request_id, indices, _ids in parsed:
+            for idx in indices:
+                idx_int = int(idx)
+                if idx_int in seen:
+                    continue
+                seen.add(idx_int)
+                union_indices.append(idx_int)
+        union_indices = sorted(union_indices)
+        union_pos = {idx: i for i, idx in enumerate(union_indices)}
+        request_columns = {
+            request_id: np.asarray([union_pos[int(idx)] for idx in indices], dtype=np.int64)
+            for request_id, indices, _ids in parsed
+        }
+        matrix = self.read_dosages(
+            chrom,
+            variant_indices=np.asarray(union_indices, dtype=np.int64),
+            sample_indices=sample_indices,
+            dtype=dtype,
+            missing=missing,
+            workers=workers,
+            backend=backend,
+            assume_no_missing=assume_no_missing,
+        )
+        info = self.variant_info(chrom)
+        chrom_alias = self._chrom_key(chrom).removeprefix("chr")
+        union_variant_ids = tuple(
+            str(info["vid"][idx]) if str(info["vid"][idx]) else f"{chrom_alias}:{int(info['pos'][idx])}"
+            for idx in union_indices
+        )
+        return HapStoreDosageBatch(
+            matrix=matrix,
+            variant_indices=np.asarray(union_indices, dtype=np.int64),
+            request_columns=request_columns,
+            request_ids=tuple(request_id for request_id, _indices, _ids in parsed),
+            variant_ids=union_variant_ids,
+            metrics=self.last_read_metrics,
+        )
+
     def variant_positions(self, chrom: str | int) -> np.ndarray:
         chrom_group = self._require_chromosome(chrom)
         return np.asarray(chrom_group["variants"]["pos"][:], dtype=np.int64)
@@ -386,6 +709,149 @@ class HapStore:
             "alt": _to_unicode_array(np.asarray(variants["alt"][:], dtype=object)).tolist(),
             "genetic_pos": genetic,
         }
+
+    def variant_index_map(self, chrom: str | int) -> dict[str, int]:
+        """Return variant ID/position aliases to variant-row indices."""
+        return dict(self._variant_index_map(chrom))
+
+    def _variant_index_map(self, chrom: str | int) -> dict[str, int]:
+        chrom_key = self._chrom_key(chrom)
+        if chrom_key not in self._variant_index_cache:
+            chrom_group = self._require_chromosome(chrom)
+            variants = chrom_group["variants"]
+            chrom_alias = str(chrom_key).removeprefix("chr")
+            out: dict[str, int] = {}
+            vid_arr = _to_unicode_array(np.asarray(variants["vid"][:], dtype=object))
+            pos_arr = np.asarray(variants["pos"][:], dtype=np.int64)
+            for i, vid in enumerate(vid_arr):
+                if vid:
+                    out.setdefault(str(vid), int(i))
+            for i, pos in enumerate(pos_arr):
+                out.setdefault(f"chr{chrom_alias}:{int(pos)}", int(i))
+                out.setdefault(f"{chrom_alias}:{int(pos)}", int(i))
+            self._variant_index_cache[chrom_key] = out
+        return self._variant_index_cache[chrom_key]
+
+    def _resolve_variant_indices(
+        self,
+        *,
+        chrom: str | int,
+        variant_ids: Sequence[str] | None,
+        variant_indices: Sequence[int] | np.ndarray | None,
+    ) -> np.ndarray:
+        if (variant_ids is None) == (variant_indices is None):
+            raise ValueError("pass exactly one of variant_ids or variant_indices")
+        if variant_ids is not None:
+            lookup = self._variant_index_map(chrom)
+            missing = [str(variant_id) for variant_id in variant_ids if str(variant_id) not in lookup]
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} variant IDs missing from HapStore chromosome {self._chrom_key(chrom)}; "
+                    f"first={missing[:5]}"
+                )
+            arr = np.asarray([lookup[str(variant_id)] for variant_id in variant_ids], dtype=np.int64)
+        else:
+            arr = np.asarray(variant_indices, dtype=np.int64)
+        if arr.ndim != 1:
+            raise ValueError(f"variant indices must be 1D, got shape={arr.shape}")
+        n_variants = self.n_variants(chrom)
+        if arr.size and (int(np.min(arr)) < 0 or int(np.max(arr)) >= n_variants):
+            raise IndexError(f"variant index out of bounds for n_variants={n_variants}")
+        return arr
+
+    def _resolve_sample_indices(
+        self,
+        *,
+        chrom: str | int,
+        sample_indices: Sequence[int] | np.ndarray | None,
+    ) -> np.ndarray:
+        n_samples = self.n_samples(chrom)
+        if sample_indices is None:
+            return np.arange(n_samples, dtype=np.int64)
+        arr = np.asarray(sample_indices)
+        if arr.dtype == np.bool_:
+            if arr.ndim != 1 or arr.shape[0] != n_samples:
+                raise ValueError(f"sample mask must be shape ({n_samples},), got {arr.shape}")
+            out = np.flatnonzero(arr).astype(np.int64, copy=False)
+        else:
+            out = np.asarray(arr, dtype=np.int64)
+        if out.ndim != 1:
+            raise ValueError(f"sample indices must be 1D, got shape={out.shape}")
+        if out.size and (int(np.min(out)) < 0 or int(np.max(out)) >= n_samples):
+            raise IndexError(f"sample index out of bounds for n_samples={n_samples}")
+        return out
+
+    def _normalize_dosage_request(
+        self,
+        chrom: str | int,
+        request: HapStoreDosageRequest | dict[str, Any] | tuple[Hashable, Sequence[str] | Sequence[int] | np.ndarray],
+        fallback_index: int,
+    ) -> tuple[Hashable, np.ndarray, tuple[str, ...] | None]:
+        if isinstance(request, HapStoreDosageRequest):
+            request_id = request.request_id
+            variant_ids = request.variant_ids
+            variant_indices = request.variant_indices
+        elif isinstance(request, dict):
+            request_id = request.get("request_id", request.get("id", fallback_index))
+            variant_ids = request.get("variant_ids")
+            variant_indices = request.get("variant_indices")
+        elif isinstance(request, tuple) and len(request) == 2:
+            request_id, variants = request
+            arr = np.asarray(variants)
+            if arr.dtype.kind in {"U", "S", "O"}:
+                variant_ids = [str(v) for v in variants]
+                variant_indices = None
+            else:
+                variant_ids = None
+                variant_indices = variants
+        else:
+            raise TypeError(f"unsupported dosage request: {request!r}")
+        indices = self._resolve_variant_indices(
+            chrom=chrom,
+            variant_ids=variant_ids,
+            variant_indices=variant_indices,
+        )
+        ids_tuple = tuple(str(v) for v in variant_ids) if variant_ids is not None else None
+        return request_id, indices, ids_tuple
+
+    def _read_dosages_serial(
+        self,
+        *,
+        chrom: str | int,
+        variant_indices: np.ndarray,
+        sample_indices: np.ndarray,
+        dtype: np.dtype,
+        missing: str,
+        assume_no_missing: bool,
+    ) -> np.ndarray:
+        span_start = int(np.min(variant_indices))
+        span_stop = int(np.max(variant_indices)) + 1
+        read_start = time.perf_counter()
+        geno = self.genotypes(chrom, variant_slice=(span_start, span_stop))
+        read_sec = time.perf_counter() - read_start
+        slice_start = time.perf_counter()
+        cols = np.asarray(variant_indices - span_start, dtype=np.int64)
+        values = geno[np.ix_(sample_indices, cols)]
+        out = _format_genotype_values(
+            values,
+            dtype=dtype,
+            missing=missing,
+            has_missing=bool(self.attrs(chrom).get("has_missing", True)) and not bool(assume_no_missing),
+        )
+        self._last_read_metrics = {
+            "backend": "serial",
+            "dataset": "genotypes" if "genotypes" in self._require_chromosome(chrom) else "haplotypes",
+            "workers": 1,
+            "n_samples": int(sample_indices.size),
+            "n_variants": int(variant_indices.size),
+            "span_variants": int(span_stop - span_start),
+            "has_missing": bool(self.attrs(chrom).get("has_missing", True)) and not bool(assume_no_missing),
+            "assume_no_missing": bool(assume_no_missing),
+            "read_sec_sum": float(read_sec),
+            "assign_sec": float(time.perf_counter() - slice_start),
+            "total_sec": float(read_sec + (time.perf_counter() - slice_start)),
+        }
+        return out
 
     def n_samples(self, chrom: str | int) -> int:
         chrom_group = self._require_chromosome(chrom)
@@ -560,6 +1026,268 @@ def _validate_sample_mask(sample_mask: np.ndarray, n_samples: int) -> np.ndarray
     if mask.dtype != np.bool_:
         mask = mask.astype(bool)
     return mask
+
+
+def _parse_positive_worker_count(workers: int | str) -> int | None:
+    if isinstance(workers, str):
+        text = workers.strip().lower()
+        if text == "auto":
+            return None
+        if not text:
+            raise ValueError("workers must be a positive integer or 'auto'")
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(f"workers must be a positive integer or 'auto', got {workers!r}") from exc
+    else:
+        value = int(workers)
+    if value <= 0:
+        raise ValueError(f"workers must be positive, got {workers}")
+    return value
+
+
+def _is_explicit_single_worker(workers: int | str) -> bool:
+    value = _parse_positive_worker_count(workers)
+    return value == 1
+
+
+def _env_positive_int(names: Sequence[str], default: int | None = None) -> tuple[int | None, str | None]:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            value = int(str(raw).strip())
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {raw!r}")
+        return value, name
+    return default, None
+
+
+def _env_positive_float(names: Sequence[str], default: float | None = None) -> tuple[float | None, str | None]:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            value = float(str(raw).strip())
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive number, got {raw!r}") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {raw!r}")
+        return value, name
+    return default, None
+
+
+def _resolve_read_worker_count(
+    workers: int | str,
+    *,
+    n_tasks: int,
+    n_sample_groups: int,
+    n_variant_groups: int,
+    n_samples: int,
+    n_variants: int,
+    row_chunk: int,
+    variant_chunk: int,
+    dataset: str,
+) -> tuple[int, dict[str, Any]]:
+    max_task_workers = max(1, min(int(n_tasks), os.cpu_count() or 1))
+    explicit_workers = _parse_positive_worker_count(workers)
+    if explicit_workers is not None:
+        resolved = max(1, min(int(explicit_workers), max_task_workers))
+        return resolved, {
+            "auto_worker_source": "explicit",
+            "auto_worker_cap": float("nan"),
+            "auto_estimated_tile_mb": float("nan"),
+        }
+
+    env_workers, env_name = _env_positive_int(("HAPSTORE_READ_WORKERS", "HAPSTORE_AUTO_READ_WORKERS"))
+    if env_workers is not None:
+        resolved = max(1, min(int(env_workers), max_task_workers))
+        return resolved, {
+            "auto_worker_source": str(env_name),
+            "auto_worker_cap": float("nan"),
+            "auto_estimated_tile_mb": float("nan"),
+        }
+
+    auto_cap, cap_source = _env_positive_int(
+        ("HAPSTORE_READ_AUTO_MAX_WORKERS", "HAPSTORE_READ_AUTO_MAX"),
+        default=8,
+    )
+    assert auto_cap is not None
+
+    input_rows = min(max(1, int(row_chunk)), max(1, int(n_samples)))
+    input_cols = min(max(1, int(variant_chunk)), max(1, int(n_variants)))
+    row_factor = 1 if str(dataset) == "genotypes" else 2
+    estimated_tile_mb = float(input_rows * input_cols * row_factor / (1024.0**2))
+
+    tasks = max(1, int(n_tasks))
+    if tasks <= 1:
+        target = 1
+        source = "single_tile"
+    elif tasks <= 4:
+        target = tasks
+        source = "few_tiles"
+    elif int(n_variant_groups) <= 1 and int(n_sample_groups) < 8:
+        target = 4
+        source = "few_row_tiles"
+    elif tasks < 16:
+        target = 8
+        source = "moderate_tiles"
+    elif tasks < 48:
+        target = 12
+        source = "many_tiles"
+    else:
+        target = 16
+        source = "large_tile_grid"
+
+    resolved = max(1, min(int(target), int(auto_cap), max_task_workers))
+    cap_label = cap_source if cap_source is not None else "default"
+    return resolved, {
+        "auto_worker_source": source,
+        "auto_worker_cap": int(auto_cap),
+        "auto_worker_cap_source": cap_label,
+        "auto_estimated_tile_mb": estimated_tile_mb,
+        "auto_max_task_workers": int(max_task_workers),
+    }
+
+
+def _make_read_groups(indices: np.ndarray, *, chunk_size: int, limit: int) -> list[_ReadGroup]:
+    if int(chunk_size) <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    pairs_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for out_pos, idx in enumerate(np.asarray(indices, dtype=np.int64)):
+        idx_int = int(idx)
+        if idx_int < 0 or idx_int >= int(limit):
+            raise IndexError(f"index {idx_int} out of bounds for limit={limit}")
+        pairs_by_chunk.setdefault(idx_int // int(chunk_size), []).append((idx_int, int(out_pos)))
+    groups: list[_ReadGroup] = []
+    for chunk_id in sorted(pairs_by_chunk):
+        pairs = sorted(pairs_by_chunk[chunk_id], key=lambda item: (item[0], item[1]))
+        start = int(pairs[0][0])
+        stop = int(pairs[-1][0]) + 1
+        groups.append(
+            _ReadGroup(
+                start=start,
+                stop=stop,
+                offsets=np.asarray([idx - start for idx, _out in pairs], dtype=np.int64),
+                out_positions=np.asarray([out for _idx, out in pairs], dtype=np.int64),
+            )
+        )
+    return groups
+
+
+def _coalesce_read_groups(
+    groups: list[_ReadGroup],
+    *,
+    max_span: int,
+    max_gap: int,
+    min_density: float,
+) -> list[_ReadGroup]:
+    if len(groups) <= 1:
+        return groups
+    if int(max_span) <= 0:
+        raise ValueError(f"max_span must be positive, got {max_span}")
+    if int(max_gap) < 0:
+        raise ValueError(f"max_gap must be non-negative, got {max_gap}")
+    if float(min_density) <= 0:
+        raise ValueError(f"min_density must be positive, got {min_density}")
+
+    out: list[_ReadGroup] = []
+    current_start = int(groups[0].start)
+    current_stop = int(groups[0].stop)
+    current_abs = [np.asarray(groups[0].start + groups[0].offsets, dtype=np.int64)]
+    current_out = [np.asarray(groups[0].out_positions, dtype=np.int64)]
+
+    def flush() -> None:
+        abs_idx = np.concatenate(current_abs).astype(np.int64, copy=False)
+        out_pos = np.concatenate(current_out).astype(np.int64, copy=False)
+        order = np.lexsort((out_pos, abs_idx))
+        abs_sorted = abs_idx[order]
+        out_sorted = out_pos[order]
+        out.append(
+            _ReadGroup(
+                start=int(abs_sorted[0]),
+                stop=int(abs_sorted[-1]) + 1,
+                offsets=np.asarray(abs_sorted - int(abs_sorted[0]), dtype=np.int64),
+                out_positions=np.asarray(out_sorted, dtype=np.int64),
+            )
+        )
+
+    for group in groups[1:]:
+        group_start = int(group.start)
+        group_stop = int(group.stop)
+        candidate_start = min(current_start, group_start)
+        candidate_stop = max(current_stop, group_stop)
+        candidate_span = int(candidate_stop - candidate_start)
+        candidate_count = int(sum(arr.size for arr in current_abs) + group.offsets.size)
+        gap = int(group_start - current_stop)
+        density = float(candidate_count / max(1, candidate_span))
+        if candidate_span <= int(max_span) and gap <= int(max_gap) and density >= float(min_density):
+            current_start = candidate_start
+            current_stop = candidate_stop
+            current_abs.append(np.asarray(group.start + group.offsets, dtype=np.int64))
+            current_out.append(np.asarray(group.out_positions, dtype=np.int64))
+            continue
+        flush()
+        current_start = group_start
+        current_stop = group_stop
+        current_abs = [np.asarray(group.start + group.offsets, dtype=np.int64)]
+        current_out = [np.asarray(group.out_positions, dtype=np.int64)]
+
+    flush()
+    return out
+
+
+def _normalize_missing_mode(missing: str) -> str:
+    mode = str(missing).lower()
+    if mode not in {"nan", "sentinel"}:
+        raise ValueError(f"missing must be one of 'nan' or 'sentinel', got {missing!r}")
+    return mode
+
+
+def _format_genotype_values(
+    values: np.ndarray,
+    *,
+    dtype: np.dtype,
+    missing: str,
+    has_missing: bool,
+) -> np.ndarray:
+    out = np.asarray(values, dtype=dtype)
+    if has_missing:
+        missing_mask = np.asarray(values) == _MISSING_SENTINEL
+        if np.any(missing_mask):
+            if missing == "nan":
+                out = out.astype(np.float32 if dtype.itemsize <= 4 else np.float64, copy=False)
+                out[missing_mask] = np.nan
+            else:
+                out[missing_mask] = np.asarray(_MISSING_SENTINEL, dtype=out.dtype)
+    return out
+
+
+def _format_haplotype_pair_values(
+    first: np.ndarray,
+    second: np.ndarray,
+    *,
+    dtype: np.dtype,
+    missing: str,
+    has_missing: bool,
+) -> np.ndarray:
+    if has_missing:
+        missing_mask = (first == _MISSING_SENTINEL) | (second == _MISSING_SENTINEL)
+    else:
+        missing_mask = None
+    summed = np.asarray(first, dtype=np.uint16) + np.asarray(second, dtype=np.uint16)
+    out = summed.astype(dtype, copy=False)
+    if missing_mask is not None and np.any(missing_mask):
+        if missing == "nan":
+            out = out.astype(np.float32 if dtype.itemsize <= 4 else np.float64, copy=False)
+            out[missing_mask] = np.nan
+        else:
+            out[missing_mask] = np.asarray(_MISSING_SENTINEL, dtype=out.dtype)
+    return out
 
 
 def _normalize_optional_str_array(
