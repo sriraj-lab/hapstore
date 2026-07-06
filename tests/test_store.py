@@ -181,6 +181,10 @@ def test_iter_blocks_haplotypes_sample_mask_match_direct(tmp_path, synthetic_arr
         chunk_haplotype_size=2,
     )
 
+    full_blocks = list(store.iter_blocks("1", block_size=2, data="haplotypes"))
+    full = np.concatenate([block.values for block in full_blocks], axis=1)
+    np.testing.assert_array_equal(full, store.haplotypes("1"))
+
     sample_mask = np.asarray([False, True])
     blocks = list(store.iter_blocks("1", block_size=2, sample_mask=sample_mask, data="haplotypes"))
     got = np.concatenate([block.values for block in blocks], axis=1)
@@ -188,6 +192,36 @@ def test_iter_blocks_haplotypes_sample_mask_match_direct(tmp_path, synthetic_arr
     np.testing.assert_array_equal(got, store.haplotypes("1", sample_mask=sample_mask))
     assert all(block.data == "haplotypes" for block in blocks)
     assert all(tuple(block.sample_indices.tolist()) == (1,) for block in blocks)
+
+
+def test_iter_blocks_genotype_fallback_matches_stored_genotypes(tmp_path, synthetic_arrays):
+    hap_only = HapStore(tmp_path / "iter_blocks_hap_only.zarr", mode="w")
+    hap_only.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        store_genotypes=False,
+    )
+
+    stored = HapStore(tmp_path / "iter_blocks_stored.zarr", mode="w")
+    stored.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=True,
+    )
+
+    variants = np.asarray([3, 1, 0], dtype=np.int64)
+    hap_blocks = list(hap_only.iter_blocks("1", block_size=2, variant_indices=variants, data="genotypes"))
+    stored_blocks = list(stored.iter_blocks("1", block_size=2, variant_indices=variants, data="genotypes"))
+
+    np.testing.assert_array_equal(
+        np.concatenate([block.values for block in hap_blocks], axis=1),
+        np.concatenate([block.values for block in stored_blocks], axis=1),
+    )
 
 
 def test_read_dosages_contiguous_matches_genotypes(tmp_path, synthetic_arrays):
