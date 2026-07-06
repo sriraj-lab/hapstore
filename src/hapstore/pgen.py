@@ -42,12 +42,15 @@ def export_pgen(
     sample_ids: list[str] | None = None,
     variant_ids: list[str] | None = None,
     variant_indices: list[int] | None = None,
+    min_maf: float | None = None,
+    filter_monomorphic: bool = False,
     variant_block_size: int = 8192,
     strict_biallelic: bool = True,
     on_partial_missing: PartialMissingPolicy = "error",
     n_workers: int = 1,
     plink2_workers: int = 1,
     plink2_path: str | Path = "plink2",
+    shard_tmp_dir: str | Path | None = None,
     keep_intermediate_shards: bool = False,
 ) -> Path:
     """Export one chromosome from HapStore directly to PGEN triplet.
@@ -67,6 +70,8 @@ def export_pgen(
             sample_ids=sample_ids,
             variant_ids=variant_ids,
             variant_indices=variant_indices,
+            min_maf=min_maf,
+            filter_monomorphic=bool(filter_monomorphic),
             variant_block_size=int(variant_block_size),
             strict_biallelic=bool(strict_biallelic),
             on_partial_missing=on_partial_missing,
@@ -83,6 +88,7 @@ def export_pgen(
     store = HapStore(store_path, mode="r")
     chrom_key = normalize_chrom(chrom, prefix=True)
     n_variants = int(store.n_variants(chrom_key))
+    sample_plan = _plan_sample_subset(store.sample_ids(chrom_key), sample_ids)
 
     prefix = _normalize_pgen_prefix(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +99,9 @@ def export_pgen(
         chrom_key=chrom_key,
         variant_ids=variant_ids,
         variant_indices=variant_indices,
+        min_maf=min_maf,
+        filter_monomorphic=bool(filter_monomorphic),
+        sample_mask=sample_plan.sample_mask,
         n_variants=n_variants,
         scan_block_size=int(variant_block_size),
     )
@@ -109,6 +118,8 @@ def export_pgen(
             chrom=chrom_key,
             sample_ids=sample_ids,
             variant_indices=[int(i) for i in selected_indices],
+            min_maf=None,
+            filter_monomorphic=False,
             variant_block_size=int(variant_block_size),
             strict_biallelic=bool(strict_biallelic),
             on_partial_missing=on_partial_missing,
@@ -116,7 +127,9 @@ def export_pgen(
 
     plink2_bin = str(resolve_plink2_binary(plink2_path))
     shard_prefixes: list[Path] = []
-    temp_root = Path(tempfile.mkdtemp(prefix=f"{prefix.name}.shards_", dir=str(prefix.parent)))
+    temp_parent = prefix.parent if shard_tmp_dir is None else Path(shard_tmp_dir)
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(tempfile.mkdtemp(prefix=f"{prefix.name}.shards_", dir=str(temp_parent)))
 
     try:
         for shard_idx, idx_array in enumerate(shard_idx_arrays):
@@ -194,6 +207,8 @@ def _export_pgen_single(
     sample_ids: list[str] | None = None,
     variant_ids: list[str] | None = None,
     variant_indices: list[int] | None = None,
+    min_maf: float | None = None,
+    filter_monomorphic: bool = False,
     variant_block_size: int = 8192,
     strict_biallelic: bool = True,
     on_partial_missing: PartialMissingPolicy = "error",
@@ -229,7 +244,10 @@ def _export_pgen_single(
     chunk_variant_size = int(store.attrs(chrom_key).get("chunk_variant_size", 500) or 500)
     if chunk_variant_size > 0:
         original_block_size = int(variant_block_size)
-        aligned = max(chunk_variant_size, (original_block_size // chunk_variant_size) * chunk_variant_size)
+        if original_block_size < chunk_variant_size:
+            aligned = original_block_size
+        else:
+            aligned = max(chunk_variant_size, (original_block_size // chunk_variant_size) * chunk_variant_size)
         if aligned != original_block_size:
             import logging
             logging.getLogger(__name__).info(
@@ -243,6 +261,9 @@ def _export_pgen_single(
         chrom_key=chrom_key,
         variant_ids=variant_ids,
         variant_indices=variant_indices,
+        min_maf=min_maf,
+        filter_monomorphic=bool(filter_monomorphic),
+        sample_mask=sample_plan.sample_mask,
         n_variants=n_variants,
         scan_block_size=int(variant_block_size),
     )
@@ -899,9 +920,13 @@ def _resolve_export_variant_indices(
     chrom_key: str,
     variant_ids: list[str] | None,
     variant_indices: list[int] | None,
+    min_maf: float | None,
+    filter_monomorphic: bool,
+    sample_mask: np.ndarray | None,
     n_variants: int,
     scan_block_size: int,
 ) -> list[int] | None:
+    threshold = _resolve_export_min_maf(min_maf=min_maf, filter_monomorphic=filter_monomorphic)
     if variant_indices is not None:
         selected = sorted(set(int(i) for i in variant_indices))
         if not selected:
@@ -911,10 +936,24 @@ def _resolve_export_variant_indices(
                 "variant_indices out of bounds for chromosome "
                 f"{chrom_key}: min={selected[0]}, max={selected[-1]}, n_variants={n_variants}"
             )
-        return selected
+        return _apply_export_min_maf_filter(
+            store=store,
+            chrom_key=chrom_key,
+            selected=selected,
+            sample_mask=sample_mask,
+            scan_block_size=int(scan_block_size),
+            threshold=threshold,
+        )
 
     if variant_ids is None:
-        return None
+        return _apply_export_min_maf_filter(
+            store=store,
+            chrom_key=chrom_key,
+            selected=None,
+            sample_mask=sample_mask,
+            scan_block_size=int(scan_block_size),
+            threshold=threshold,
+        )
 
     chrom_group = store.root[chrom_key]
     variants = chrom_group["variants"]
@@ -927,7 +966,47 @@ def _resolve_export_variant_indices(
     )
     if not selected:
         raise ValueError("variant_ids resolved to an empty variant set")
-    return selected
+    return _apply_export_min_maf_filter(
+        store=store,
+        chrom_key=chrom_key,
+        selected=selected,
+        sample_mask=sample_mask,
+        scan_block_size=int(scan_block_size),
+        threshold=threshold,
+    )
+
+
+def _resolve_export_min_maf(*, min_maf: float | None, filter_monomorphic: bool) -> float | None:
+    if min_maf is None:
+        return 1e-12 if bool(filter_monomorphic) else None
+    value = float(min_maf)
+    if value < 0 or value > 0.5:
+        raise ValueError(f"min_maf must be between 0 and 0.5, got {min_maf}")
+    return value
+
+
+def _apply_export_min_maf_filter(
+    *,
+    store: HapStore,
+    chrom_key: str,
+    selected: list[int] | None,
+    sample_mask: np.ndarray | None,
+    scan_block_size: int,
+    threshold: float | None,
+) -> list[int] | None:
+    if threshold is None:
+        return selected
+    kept = store.non_monomorphic_variant_indices(
+        chrom_key,
+        sample_mask=sample_mask,
+        variant_indices=selected,
+        block_size=int(scan_block_size),
+        min_maf=float(threshold),
+    )
+    out = [int(i) for i in np.asarray(kept, dtype=np.int64).tolist()]
+    if not out:
+        raise ValueError("selected variant set is empty after applying MAF filters")
+    return out
 
 
 def _merge_pgen_shards_with_plink(

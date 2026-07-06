@@ -199,6 +199,49 @@ def test_export_pgen_partial_missing_policy(tmp_path):
     assert h[1, 0] == 255
 
 
+def test_export_pgen_filter_monomorphic_prefilter(tmp_path):
+    store_path = tmp_path / "prefilter_source.zarr"
+    ingest_arrays(
+        output_zarr=store_path,
+        chrom="1",
+        haplotypes=np.asarray(
+            [
+                [0, 0, 1],
+                [0, 1, 1],
+                [0, 0, 1],
+                [0, 0, 1],
+            ],
+            dtype=np.uint8,
+        ),
+        variant_pos=np.asarray([100, 200, 300], dtype=np.int64),
+        sample_ids=["s1", "s2"],
+        ref=["A", "C", "G"],
+        alt=["G", "T", "A"],
+        vid=["v1", "v2", "v3"],
+        chunk_variant_size=1,
+        chunk_haplotype_size=2,
+    )
+
+    prefix = export_pgen(
+        store_path=store_path,
+        out_prefix=tmp_path / "prefilter" / "chr1",
+        chrom="1",
+        filter_monomorphic=True,
+        variant_block_size=1,
+    )
+    out = ingest_pgen(
+        pgen_prefix=prefix,
+        output_zarr=tmp_path / "prefilter_roundtrip.zarr",
+        chrom="1",
+    )
+
+    assert out.variant_positions("1").tolist() == [200]
+    np.testing.assert_array_equal(
+        out.haplotypes("1"),
+        HapStore(store_path, mode="r").haplotypes("1", variant_slice=(1, 2)),
+    )
+
+
 def test_export_pgen_parallel_sharded_roundtrip(tmp_path):
     if shutil.which("plink2") is None:
         pytest.skip("plink2 binary is required for sharded export_pgen merge test")
@@ -238,3 +281,27 @@ def test_export_pgen_parallel_sharded_roundtrip(tmp_path):
     np.testing.assert_array_equal(serial_store.haplotypes("1"), sharded_store.haplotypes("1"))
     assert serial_store.variant_positions("1").tolist() == sharded_store.variant_positions("1").tolist()
     assert serial_store.sample_ids("1") == sharded_store.sample_ids("1")
+
+
+def test_export_pgen_parallel_shards_use_configured_tmp_dir(tmp_path):
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 binary is required for sharded export_pgen merge test")
+
+    store_path = tmp_path / "source.zarr"
+    _build_store(store_path)
+    scratch = tmp_path / "scratch"
+
+    export_pgen(
+        store_path=store_path,
+        out_prefix=tmp_path / "sharded_tmp" / "chr1",
+        chrom="1",
+        variant_block_size=2,
+        n_workers=2,
+        plink2_workers=1,
+        plink2_path="system",
+        shard_tmp_dir=scratch,
+        keep_intermediate_shards=True,
+    )
+
+    assert scratch.exists()
+    assert any(path.name.startswith("chr1.shards_") for path in scratch.iterdir())

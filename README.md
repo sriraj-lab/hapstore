@@ -167,6 +167,8 @@ For chunk-aligned scans, `iter_blocks(chrom, data="genotypes")` yields `HapStore
 
 `variant_maf(...)` computes alternate-allele frequency, MAF, alternate-allele counts, and called genotype/allele counts with missing genotypes excluded from denominators. It supports the same sample and variant subset arguments as `iter_blocks`; `non_monomorphic_variant_indices(...)` returns the ordered subset with MAF above a threshold.
 
+`export_pgen(...)` can prefilter variants before writing with `filter_monomorphic=True` or `min_maf=<threshold>`, using HapStore MAF scans for the selected sample set. Multi-worker PGEN export accepts `shard_tmp_dir` to place temporary shard triplets on scratch before PLINK2 merge.
+
 ## Relationship to forgephast
 
 `forgephast` depends on the public `hapstore` API for donor-panel caching, synthetic output storage, QC input loading, and phenotype genotype access. Internal refactors in this repo are intended to keep that public surface stable.
