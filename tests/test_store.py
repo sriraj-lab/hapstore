@@ -110,6 +110,86 @@ def test_genotypes_on_the_fly_and_stored(tmp_path, synthetic_arrays):
     np.testing.assert_array_equal(got_b, expected)
 
 
+def test_iter_blocks_genotypes_default_blocks_match_direct(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "iter_blocks_default.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=True,
+    )
+
+    blocks = list(store.iter_blocks("1", data="genotypes"))
+
+    assert [(block.start, block.stop) for block in blocks] == [(0, 2), (2, 4)]
+    np.testing.assert_array_equal(
+        np.concatenate([block.values for block in blocks], axis=1),
+        store.genotypes("1"),
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([block.variant_indices for block in blocks]),
+        np.arange(4, dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([block.positions for block in blocks]),
+        synthetic_arrays["variant_pos"],
+    )
+    assert blocks[0].ref == ("A", "C")
+    assert blocks[0].alt == ("G", "T")
+    assert blocks[0].vid == ("v1", "v2")
+    np.testing.assert_allclose(blocks[0].genetic_pos, synthetic_arrays["genetic_positions"][:2])
+
+
+def test_iter_blocks_preserves_requested_variant_and_sample_order(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "iter_blocks_order.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=1,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=True,
+    )
+
+    requested_variants = np.asarray([3, 0, 2], dtype=np.int64)
+    requested_samples = np.asarray([1, 0], dtype=np.int64)
+    blocks = list(
+        store.iter_blocks(
+            "1",
+            block_size=2,
+            variant_indices=requested_variants,
+            sample_indices=requested_samples,
+            data="genotypes",
+        )
+    )
+
+    assert [tuple(block.variant_indices.tolist()) for block in blocks] == [(3, 0), (2,)]
+    assert [block.vid for block in blocks] == [("v4", "v1"), ("v3",)]
+    got = np.concatenate([block.values for block in blocks], axis=1)
+    expected = store.genotypes("1")[np.ix_(requested_samples, requested_variants)]
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_iter_blocks_haplotypes_sample_mask_match_direct(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "iter_blocks_haps.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=3,
+        chunk_haplotype_size=2,
+    )
+
+    sample_mask = np.asarray([False, True])
+    blocks = list(store.iter_blocks("1", block_size=2, sample_mask=sample_mask, data="haplotypes"))
+    got = np.concatenate([block.values for block in blocks], axis=1)
+
+    np.testing.assert_array_equal(got, store.haplotypes("1", sample_mask=sample_mask))
+    assert all(block.data == "haplotypes" for block in blocks)
+    assert all(tuple(block.sample_indices.tolist()) == (1,) for block in blocks)
+
+
 def test_read_dosages_contiguous_matches_genotypes(tmp_path, synthetic_arrays):
     store = HapStore(tmp_path / "dosage_contiguous.zarr", mode="w")
     store.create_chromosome(

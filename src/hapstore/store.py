@@ -60,6 +60,23 @@ class HapStoreDosageBatch:
 
 
 @dataclass(frozen=True)
+class HapStoreBlock:
+    """One variant-axis block from a HapStore chromosome."""
+
+    values: np.ndarray
+    variant_indices: np.ndarray
+    positions: np.ndarray
+    ref: tuple[str, ...]
+    alt: tuple[str, ...]
+    vid: tuple[str, ...]
+    start: int
+    stop: int
+    data: str
+    sample_indices: np.ndarray
+    genetic_pos: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
 class _ReadGroup:
     start: int
     stop: int
@@ -411,6 +428,83 @@ class HapStore:
         haps = self.haplotypes(chrom, variant_slice=variant_sel, sample_mask=sample_mask)
         return _haplotypes_to_genotypes(haps)
 
+    def iter_blocks(
+        self,
+        chrom: str | int,
+        *,
+        axis: str = "variants",
+        block_size: int | None = None,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        sample_mask: np.ndarray | None = None,
+        data: str = "genotypes",
+        dtype: str | np.dtype = "uint8",
+    ) -> Iterator[HapStoreBlock]:
+        """Yield chunk-aligned variant-axis blocks with aligned metadata."""
+        axis_name = str(axis).lower()
+        if axis_name != "variants":
+            raise ValueError(f"axis must be 'variants', got {axis!r}")
+        data_name = str(data).lower()
+        if data_name not in {"genotypes", "haplotypes"}:
+            raise ValueError(f"data must be one of 'genotypes' or 'haplotypes', got {data!r}")
+        if sample_indices is not None and sample_mask is not None:
+            raise ValueError("pass at most one of sample_indices or sample_mask")
+
+        chrom_group = self._require_chromosome(chrom)
+        sample_source = sample_mask if sample_mask is not None else sample_indices
+        sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_source)
+        arr_name = "genotypes" if data_name == "genotypes" and "genotypes" in chrom_group else "haplotypes"
+        variant_chunk = int(chrom_group[arr_name].chunks[1])
+        n_variants = self.n_variants(chrom)
+        block_len = _normalize_block_size(block_size, default=variant_chunk)
+
+        if variant_indices is None:
+            blocks = (
+                np.arange(start, min(start + block_len, n_variants), dtype=np.int64)
+                for start in range(0, n_variants, block_len)
+            )
+        else:
+            requested = np.asarray(variant_indices, dtype=np.int64)
+            if requested.ndim != 1:
+                raise ValueError(f"variant_indices must be 1D, got shape={requested.shape}")
+            if requested.size and (int(np.min(requested)) < 0 or int(np.max(requested)) >= n_variants):
+                raise IndexError(f"variant index out of bounds for n_variants={n_variants}")
+            blocks = (
+                np.asarray(requested[start : start + block_len], dtype=np.int64)
+                for start in range(0, requested.size, block_len)
+            )
+
+        for block_indices in blocks:
+            if block_indices.size == 0:
+                continue
+            block_start = int(np.min(block_indices))
+            block_stop = int(np.max(block_indices)) + 1
+            values = self._read_block_values(
+                chrom_group=chrom_group,
+                chrom=chrom,
+                data=data_name,
+                variant_indices=block_indices,
+                sample_indices=sample_idx,
+                dtype=np.dtype(dtype),
+            )
+            metadata = self._read_variant_metadata_block(
+                chrom_group=chrom_group,
+                variant_indices=block_indices,
+            )
+            yield HapStoreBlock(
+                values=values,
+                variant_indices=np.asarray(block_indices, dtype=np.int64).copy(),
+                positions=metadata["positions"],
+                ref=metadata["ref"],
+                alt=metadata["alt"],
+                vid=metadata["vid"],
+                start=block_start,
+                stop=block_stop,
+                data=data_name,
+                sample_indices=np.asarray(sample_idx, dtype=np.int64).copy(),
+                genetic_pos=metadata["genetic_pos"],
+            )
+
     def read_dosages(
         self,
         chrom: str | int,
@@ -617,6 +711,85 @@ class HapStore:
             "total_sec": float(time.perf_counter() - total_start),
         }
         return out
+
+    def _read_block_values(
+        self,
+        *,
+        chrom_group: zarr.Group,
+        chrom: str | int,
+        data: str,
+        variant_indices: np.ndarray,
+        sample_indices: np.ndarray,
+        dtype: np.dtype,
+    ) -> np.ndarray:
+        span_start = int(np.min(variant_indices))
+        span_stop = int(np.max(variant_indices)) + 1
+        offsets = np.asarray(variant_indices - span_start, dtype=np.int64)
+        n_variants = int(variant_indices.size)
+
+        if data == "haplotypes":
+            if sample_indices.size == 0:
+                return np.empty((0, n_variants), dtype=dtype)
+            arr = chrom_group["haplotypes"]
+            hap_indices = np.empty(sample_indices.size * 2, dtype=np.int64)
+            hap_indices[0::2] = 2 * sample_indices
+            hap_indices[1::2] = (2 * sample_indices) + 1
+            n_total = self.n_samples(chrom)
+            if sample_indices.size > n_total // 2:
+                full = np.asarray(arr[:, span_start:span_stop], dtype=np.uint8)
+                block = full[hap_indices]
+            else:
+                block = np.asarray(arr.oindex[hap_indices, slice(span_start, span_stop)], dtype=np.uint8)
+            return np.asarray(block[:, offsets], dtype=dtype)
+
+        if data != "genotypes":
+            raise ValueError(f"data must be one of 'genotypes' or 'haplotypes', got {data!r}")
+        if sample_indices.size == 0:
+            return np.empty((0, n_variants), dtype=dtype)
+        if "genotypes" in chrom_group:
+            arr = chrom_group["genotypes"]
+            n_total = self.n_samples(chrom)
+            if sample_indices.size > n_total // 2:
+                full = np.asarray(arr[:, span_start:span_stop], dtype=np.uint8)
+                block = full[sample_indices]
+            else:
+                block = np.asarray(arr.oindex[sample_indices, slice(span_start, span_stop)], dtype=np.uint8)
+            return np.asarray(block[:, offsets], dtype=dtype)
+
+        haps = self._read_block_values(
+            chrom_group=chrom_group,
+            chrom=chrom,
+            data="haplotypes",
+            variant_indices=variant_indices,
+            sample_indices=sample_indices,
+            dtype=np.dtype("uint8"),
+        )
+        return np.asarray(_haplotypes_to_genotypes(haps), dtype=dtype)
+
+    def _read_variant_metadata_block(
+        self,
+        *,
+        chrom_group: zarr.Group,
+        variant_indices: np.ndarray,
+    ) -> dict[str, Any]:
+        span_start = int(np.min(variant_indices))
+        span_stop = int(np.max(variant_indices)) + 1
+        offsets = np.asarray(variant_indices - span_start, dtype=np.int64)
+        variants = chrom_group["variants"]
+        positions = np.asarray(variants["pos"][span_start:span_stop], dtype=np.int64)[offsets]
+        ref = _to_unicode_array(np.asarray(variants["ref"][span_start:span_stop], dtype=object))[offsets]
+        alt = _to_unicode_array(np.asarray(variants["alt"][span_start:span_stop], dtype=object))[offsets]
+        vid = _to_unicode_array(np.asarray(variants["vid"][span_start:span_stop], dtype=object))[offsets]
+        genetic = None
+        if "genetic_pos" in variants:
+            genetic = np.asarray(variants["genetic_pos"][span_start:span_stop], dtype=np.float64)[offsets]
+        return {
+            "positions": np.asarray(positions, dtype=np.int64),
+            "ref": tuple(str(x) for x in ref),
+            "alt": tuple(str(x) for x in alt),
+            "vid": tuple(str(x) for x in vid),
+            "genetic_pos": genetic,
+        }
 
     def read_dosage_batch(
         self,
@@ -1015,6 +1188,16 @@ def _normalize_variant_slice(
             raise ValueError(f"variant_slice step must be None or 1, got {variant_slice.step}")
         return variant_slice
     raise ValueError(f"variant_slice must be slice, tuple(start,end), or None; got {type(variant_slice)}")
+
+
+def _normalize_block_size(block_size: int | None, *, default: int) -> int:
+    if block_size is None:
+        value = int(default)
+    else:
+        value = int(block_size)
+    if value <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    return value
 
 
 def _validate_sample_mask(sample_mask: np.ndarray, n_samples: int) -> np.ndarray:
