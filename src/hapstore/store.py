@@ -505,6 +505,108 @@ class HapStore:
                 genetic_pos=metadata["genetic_pos"],
             )
 
+    def variant_maf(
+        self,
+        chrom: str | int,
+        *,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        sample_mask: np.ndarray | None = None,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        block_size: int | None = None,
+        min_maf: float | None = None,
+        include_metadata: bool = True,
+    ) -> dict[str, Any]:
+        """Compute per-variant alternate-allele frequency and MAF."""
+        threshold = _normalize_min_maf(min_maf)
+        chunks: dict[str, list[np.ndarray]] = {
+            "variant_indices": [],
+            "allele_frequency": [],
+            "maf": [],
+            "alt_allele_count": [],
+            "called_genotype_count": [],
+            "called_allele_count": [],
+        }
+        if include_metadata:
+            chunks.update(
+                {
+                    "positions": [],
+                    "ref": [],
+                    "alt": [],
+                    "vid": [],
+                    "genetic_pos": [],
+                }
+            )
+        saw_genetic = False
+
+        for block in self.iter_blocks(
+            chrom,
+            block_size=block_size,
+            variant_indices=variant_indices,
+            sample_indices=sample_indices,
+            sample_mask=sample_mask,
+            data="genotypes",
+            dtype="uint8",
+        ):
+            values = np.asarray(block.values, dtype=np.uint8)
+            called = values != _MISSING_SENTINEL
+            called_genotypes = np.count_nonzero(called, axis=0).astype(np.int64, copy=False)
+            alt_counts = np.where(called, values, 0).sum(axis=0, dtype=np.int64)
+            called_alleles = (2 * called_genotypes).astype(np.int64, copy=False)
+            af = np.full(values.shape[1], np.nan, dtype=np.float64)
+            np.divide(
+                alt_counts,
+                called_alleles,
+                out=af,
+                where=called_alleles > 0,
+                casting="unsafe",
+            )
+            maf = np.minimum(af, 1.0 - af)
+
+            chunks["variant_indices"].append(np.asarray(block.variant_indices, dtype=np.int64))
+            chunks["allele_frequency"].append(af)
+            chunks["maf"].append(maf)
+            chunks["alt_allele_count"].append(np.asarray(alt_counts, dtype=np.int64))
+            chunks["called_genotype_count"].append(np.asarray(called_genotypes, dtype=np.int64))
+            chunks["called_allele_count"].append(np.asarray(called_alleles, dtype=np.int64))
+            if include_metadata:
+                chunks["positions"].append(np.asarray(block.positions, dtype=np.int64))
+                chunks["ref"].append(np.asarray(block.ref, dtype=object))
+                chunks["alt"].append(np.asarray(block.alt, dtype=object))
+                chunks["vid"].append(np.asarray(block.vid, dtype=object))
+                if block.genetic_pos is not None:
+                    saw_genetic = True
+                    chunks["genetic_pos"].append(np.asarray(block.genetic_pos, dtype=np.float64))
+                else:
+                    chunks["genetic_pos"].append(np.full(block.variant_indices.size, np.nan, dtype=np.float64))
+
+        table = _concatenate_maf_chunks(chunks, include_metadata=include_metadata, saw_genetic=saw_genetic)
+        if threshold is not None:
+            keep = np.isfinite(table["maf"]) & (table["maf"] >= threshold)
+            table = _filter_table_rows(table, keep)
+        return table
+
+    def non_monomorphic_variant_indices(
+        self,
+        chrom: str | int,
+        *,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        sample_mask: np.ndarray | None = None,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        block_size: int | None = None,
+        min_maf: float = 1e-12,
+    ) -> np.ndarray:
+        """Return variant indices with MAF at least ``min_maf``."""
+        table = self.variant_maf(
+            chrom,
+            sample_indices=sample_indices,
+            sample_mask=sample_mask,
+            variant_indices=variant_indices,
+            block_size=block_size,
+            min_maf=min_maf,
+            include_metadata=False,
+        )
+        return np.asarray(table["variant_indices"], dtype=np.int64)
+
     def read_dosages(
         self,
         chrom: str | int,
@@ -1198,6 +1300,71 @@ def _normalize_block_size(block_size: int | None, *, default: int) -> int:
     if value <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
     return value
+
+
+def _normalize_min_maf(min_maf: float | None) -> float | None:
+    if min_maf is None:
+        return None
+    value = float(min_maf)
+    if value < 0 or value > 0.5:
+        raise ValueError(f"min_maf must be between 0 and 0.5, got {min_maf}")
+    return value
+
+
+def _concatenate_maf_chunks(
+    chunks: dict[str, list[np.ndarray]],
+    *,
+    include_metadata: bool,
+    saw_genetic: bool,
+) -> dict[str, Any]:
+    table: dict[str, Any] = {}
+    numeric_defaults: dict[str, np.dtype] = {
+        "variant_indices": np.dtype(np.int64),
+        "allele_frequency": np.dtype(np.float64),
+        "maf": np.dtype(np.float64),
+        "alt_allele_count": np.dtype(np.int64),
+        "called_genotype_count": np.dtype(np.int64),
+        "called_allele_count": np.dtype(np.int64),
+        "positions": np.dtype(np.int64),
+        "genetic_pos": np.dtype(np.float64),
+    }
+    for key in (
+        "variant_indices",
+        "allele_frequency",
+        "maf",
+        "alt_allele_count",
+        "called_genotype_count",
+        "called_allele_count",
+    ):
+        values = chunks.get(key, [])
+        table[key] = np.concatenate(values) if values else np.empty(0, dtype=numeric_defaults[key])
+    if include_metadata:
+        for key in ("positions", "ref", "alt", "vid"):
+            values = chunks.get(key, [])
+            if values:
+                table[key] = np.concatenate(values)
+            else:
+                dtype = numeric_defaults.get(key, np.dtype(object))
+                table[key] = np.empty(0, dtype=dtype)
+        genetic_values = chunks.get("genetic_pos", [])
+        table["genetic_pos"] = (
+            np.concatenate(genetic_values) if saw_genetic and genetic_values else None
+        )
+    return table
+
+
+def _filter_table_rows(table: dict[str, Any], keep: np.ndarray) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in table.items():
+        if value is None:
+            out[key] = None
+            continue
+        arr = np.asarray(value)
+        if arr.ndim > 0 and arr.shape[0] == keep.shape[0]:
+            out[key] = arr[keep]
+        else:
+            out[key] = value
+    return out
 
 
 def _validate_sample_mask(sample_mask: np.ndarray, n_samples: int) -> np.ndarray:

@@ -344,6 +344,81 @@ def test_read_dosages_stored_and_haplotype_only_are_equal(tmp_path, synthetic_ar
     np.testing.assert_allclose(got_hap, got_stored, equal_nan=True)
 
 
+def test_variant_maf_matches_direct_numpy_and_handles_missing(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "maf_direct.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=True,
+    )
+
+    table = store.variant_maf("1", block_size=2)
+
+    np.testing.assert_array_equal(table["variant_indices"], np.arange(4, dtype=np.int64))
+    np.testing.assert_allclose(table["allele_frequency"][:3], np.asarray([0.25, 0.75, 0.5]))
+    np.testing.assert_allclose(table["maf"][:3], np.asarray([0.25, 0.25, 0.5]))
+    assert np.isnan(table["allele_frequency"][3])
+    assert np.isnan(table["maf"][3])
+    np.testing.assert_array_equal(table["alt_allele_count"], np.asarray([1, 3, 2, 0]))
+    np.testing.assert_array_equal(table["called_genotype_count"], np.asarray([2, 2, 2, 0]))
+    np.testing.assert_array_equal(table["called_allele_count"], np.asarray([4, 4, 4, 0]))
+    np.testing.assert_array_equal(table["positions"], synthetic_arrays["variant_pos"])
+    np.testing.assert_array_equal(table["vid"], synthetic_arrays["vid"])
+
+
+def test_variant_maf_sample_subset_and_non_monomorphic_indices(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "maf_subset.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=True,
+    )
+
+    subset = store.variant_maf("1", sample_indices=[1], include_metadata=False)
+
+    np.testing.assert_allclose(subset["maf"][:3], np.asarray([0.0, 0.5, 0.0]))
+    assert np.isnan(subset["maf"][3])
+    np.testing.assert_array_equal(
+        store.non_monomorphic_variant_indices("1", sample_indices=[1]),
+        np.asarray([1], dtype=np.int64),
+    )
+
+
+def test_variant_maf_haplotype_fallback_matches_stored_and_filters_in_request_order(tmp_path, synthetic_arrays):
+    hap_only = HapStore(tmp_path / "maf_hap_only.zarr", mode="w")
+    hap_only.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        store_genotypes=False,
+    )
+    stored = HapStore(tmp_path / "maf_stored.zarr", mode="w")
+    stored.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=True,
+    )
+
+    variants = np.asarray([2, 0, 3], dtype=np.int64)
+    hap_table = hap_only.variant_maf("1", variant_indices=variants, min_maf=0.1)
+    stored_table = stored.variant_maf("1", variant_indices=variants, min_maf=0.1)
+
+    np.testing.assert_array_equal(hap_table["variant_indices"], np.asarray([2, 0], dtype=np.int64))
+    np.testing.assert_array_equal(hap_table["positions"], np.asarray([300, 100], dtype=np.int64))
+    np.testing.assert_allclose(hap_table["maf"], stored_table["maf"])
+    np.testing.assert_array_equal(hap_table["alt_allele_count"], stored_table["alt_allele_count"])
+
+
 def test_read_dosage_batch_window_matrix_and_project(tmp_path, synthetic_arrays):
     store = HapStore(tmp_path / "dosage_batch.zarr", mode="w")
     store.create_chromosome(

@@ -165,6 +165,8 @@ w1_score = batch.project("w1", weights=[0.2, -0.1])
 
 For chunk-aligned scans, `iter_blocks(chrom, data="genotypes")` yields `HapStoreBlock` objects with `values`, `variant_indices`, `positions`, `ref`, `alt`, `vid`, `start`, and `stop`. Default blocks follow the on-disk variant chunk size. Explicit `variant_indices`, `sample_indices`, or `sample_mask` requests preserve caller order within each yielded block.
 
+`variant_maf(...)` computes alternate-allele frequency, MAF, alternate-allele counts, and called genotype/allele counts with missing genotypes excluded from denominators. It supports the same sample and variant subset arguments as `iter_blocks`; `non_monomorphic_variant_indices(...)` returns the ordered subset with MAF above a threshold.
+
 ## Relationship to forgephast
 
 `forgephast` depends on the public `hapstore` API for donor-panel caching, synthetic output storage, QC input loading, and phenotype genotype access. Internal refactors in this repo are intended to keep that public surface stable.
