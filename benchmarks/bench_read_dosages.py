@@ -182,6 +182,7 @@ def _build_cases(
     high_fraction: float,
     low_fraction: float,
     sparse_variants: int,
+    contiguous_variants: int,
     batch_requests: int,
     batch_window_size: int,
     maf_block_size: int | None,
@@ -201,6 +202,7 @@ def _build_cases(
                     high_fraction=high_fraction,
                     low_fraction=low_fraction,
                     sparse_variants=sparse_variants,
+                    contiguous_variants=contiguous_variants,
                     batch_requests=batch_requests,
                     batch_window_size=batch_window_size,
                     maf_block_size=maf_block_size,
@@ -208,12 +210,12 @@ def _build_cases(
             )
             continue
         if case_name == "full_contiguous":
-            cases.append(ReadCase(case_name, variant_indices=_contiguous_indices(n_variants, min(5000, n_variants))))
+            cases.append(ReadCase(case_name, variant_indices=_contiguous_indices(n_variants, contiguous_variants)))
         elif case_name == "high_fraction":
             cases.append(
                 ReadCase(
                     case_name,
-                    variant_indices=_contiguous_indices(n_variants, min(5000, n_variants)),
+                    variant_indices=_contiguous_indices(n_variants, contiguous_variants),
                     sample_indices=_sample_indices(n_samples, high_fraction, rng),
                 )
             )
@@ -221,7 +223,7 @@ def _build_cases(
             cases.append(
                 ReadCase(
                     case_name,
-                    variant_indices=_contiguous_indices(n_variants, min(5000, n_variants)),
+                    variant_indices=_contiguous_indices(n_variants, contiguous_variants),
                     sample_indices=_sample_indices(n_samples, low_fraction, rng),
                 )
             )
@@ -603,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260706)
     parser.add_argument("--high-sample-fraction", type=float, default=0.75)
     parser.add_argument("--low-sample-fraction", type=float, default=0.10)
+    parser.add_argument("--contiguous-variants", type=int, default=5000, help="Variant count for full/high/low contiguous cases")
     parser.add_argument("--sparse-variants", type=int, default=1000)
     parser.add_argument("--batch-requests", type=int, default=8)
     parser.add_argument("--batch-window-size", type=int, default=512)
@@ -638,6 +641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         high_fraction=float(args.high_sample_fraction),
         low_fraction=float(args.low_sample_fraction),
         sparse_variants=int(args.sparse_variants),
+        contiguous_variants=int(args.contiguous_variants),
         batch_requests=int(args.batch_requests),
         batch_window_size=int(args.batch_window_size),
         maf_block_size=args.maf_block_size,
