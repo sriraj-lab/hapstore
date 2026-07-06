@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from hapstore import HapStore, HapStoreDosageRequest
+from hapstore import store as store_module
 
 
 def test_create_and_read_roundtrip(tmp_path, synthetic_arrays):
@@ -170,6 +171,31 @@ def test_read_dosages_auto_workers_match_serial(tmp_path, synthetic_arrays, monk
     np.testing.assert_allclose(auto, serial, equal_nan=True)
     assert metrics["auto_worker_source"] == "HAPSTORE_READ_WORKERS"
     assert 1 <= int(metrics["workers"]) <= 3
+
+
+def test_read_dosages_auto_default_cap_is_sixteen(monkeypatch):
+    monkeypatch.delenv("HAPSTORE_READ_WORKERS", raising=False)
+    monkeypatch.delenv("HAPSTORE_AUTO_READ_WORKERS", raising=False)
+    monkeypatch.delenv("HAPSTORE_READ_AUTO_MAX_WORKERS", raising=False)
+    monkeypatch.delenv("HAPSTORE_READ_AUTO_MAX", raising=False)
+    monkeypatch.setattr(store_module.os, "cpu_count", lambda: 32)
+
+    workers, policy = store_module._resolve_read_worker_count(
+        "auto",
+        n_tasks=100,
+        n_sample_groups=10,
+        n_variant_groups=10,
+        n_samples=150_000,
+        n_variants=5_000,
+        row_chunk=7_500,
+        variant_chunk=500,
+        dataset="haplotypes",
+    )
+
+    assert workers == 16
+    assert policy["auto_worker_cap"] == 16
+    assert policy["auto_worker_cap_source"] == "default"
+    assert policy["auto_worker_source"] == "large_tile_grid"
 
 
 def test_read_dosages_missing_modes(tmp_path, synthetic_arrays):

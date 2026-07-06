@@ -1114,7 +1114,7 @@ def _resolve_read_worker_count(
 
     auto_cap, cap_source = _env_positive_int(
         ("HAPSTORE_READ_AUTO_MAX_WORKERS", "HAPSTORE_READ_AUTO_MAX"),
-        default=8,
+        default=16,
     )
     assert auto_cap is not None
 
