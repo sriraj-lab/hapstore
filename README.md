@@ -57,6 +57,17 @@ Helpers:
 - `hapstore.compute_window_boundaries(...)`
 - `hapstore.compute_window_midpoints(...)`
 
+## Developer docs
+
+- [`docs/internal-architecture.md`](docs/internal-architecture.md) describes the public API boundary, internal helper layout, and PGEN/pgenlib split.
+
+## Benchmarks
+
+Development benchmarks live under `benchmarks/` and are intended to be run from
+a source checkout or installed development environment. Use `bench_read_dosages.py`
+for the maintained read-speed matrix and `bench_pgen_export.py` for focused
+PGEN-export-adjacent component timing.
+
 ## Data model
 
 Each store is a zarr hierarchy keyed by chromosome, for example `chr1`, `chr2`, `chrX`.

@@ -1,4 +1,4 @@
-"""Private fast-path wrappers for pgenlib read/write operations.
+"""Private adapter layer for pgenlib read/write operations.
 
 This module intentionally provides a small compatibility surface used by
 `hapstore.pgen`.
@@ -26,7 +26,7 @@ def ensure_pgenlib_available() -> None:
         )
 
 
-class PgenFastWriter:
+class PgenlibWriter:
     """Thin writer wrapper over pgenlib.PgenWriter."""
 
     def __init__(self, pgen_path: str | Path, sample_ct: int, variant_ct: int) -> None:
@@ -47,6 +47,7 @@ class PgenFastWriter:
         )
 
     def append_alleles_batch(self, allele_batch: np.ndarray) -> None:
+        # pgenlib expects variant-major allele hardcalls shaped (variants, 2 * samples).
         arr = np.asarray(allele_batch)
         if arr.ndim != 2:
             raise ValueError(f"allele_batch must be 2D, got shape={arr.shape}")
@@ -63,7 +64,7 @@ class PgenFastWriter:
     def close(self) -> None:
         self._writer.close()
 
-    def __enter__(self) -> "PgenFastWriter":
+    def __enter__(self) -> "PgenlibWriter":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -77,7 +78,7 @@ class PgenFastWriter:
             pass
 
 
-class PgenFastReader:
+class PgenlibReader:
     """Thin reader wrapper over pgenlib.PgenReader/PvarReader."""
 
     def __init__(
@@ -131,6 +132,7 @@ class PgenFastReader:
             raise ValueError("allele_buf must be C-contiguous")
         if not phase.flags["C_CONTIGUOUS"]:
             raise ValueError("phasepresent_buf must be C-contiguous")
+        # hap_maj=False requests the same variant-major layout used by export.
         self._reader.read_alleles_and_phasepresent_range(
             int(start),
             int(end),
@@ -167,7 +169,7 @@ class PgenFastReader:
         self._reader.close()
         self._pvar.close()
 
-    def __enter__(self) -> "PgenFastReader":
+    def __enter__(self) -> "PgenlibReader":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

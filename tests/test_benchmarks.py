@@ -5,6 +5,7 @@ import json
 
 import numpy as np
 
+from benchmarks.bench_pgen_export import main as pgen_export_main
 from benchmarks.bench_read_dosages import main
 from hapstore import HapStore
 
@@ -96,3 +97,32 @@ def test_bench_read_dosages_cli_writes_rows_and_metadata(tmp_path):
     assert metadata["store_metadata"]["n_samples"] == 12
     assert metadata["store_metadata"]["n_variants"] == 48
     assert metadata["store_metadata"]["dataset"] == "genotypes"
+
+
+def test_bench_pgen_export_cli_runs_component_timings(tmp_path, capsys):
+    store_path = _make_benchmark_store(tmp_path / "bench.zarr")
+
+    exit_code = pgen_export_main(
+        [
+            "--store",
+            str(store_path),
+            "--chrom",
+            "1",
+            "--reps",
+            "1",
+            "--metadata-block-sizes",
+            "4,8",
+            "--sample-window-variants",
+            "8",
+            "--chunk-block-sizes",
+            "4,8",
+            "--chunk-max-variants",
+            "16",
+        ]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Variant metadata reads" in out
+    assert "Haplotype read with" in out
+    assert "Chunk alignment" in out

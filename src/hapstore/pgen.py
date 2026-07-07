@@ -1,4 +1,8 @@
-"""Direct HapStore <-> PGEN I/O helpers (biallelic, phased)."""
+"""Direct HapStore <-> PGEN I/O helpers (biallelic, phased).
+
+This module owns the public conversion behavior. Low-level pgenlib buffer
+handling is isolated in hapstore._internal.pgenlib_io.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ import numpy as np
 from hapstore.chrom import normalize_chrom
 from hapstore.ids import read_sample_ids
 
-from ._pgen_fast import PgenFastReader, PgenFastWriter, ensure_pgenlib_available
 from ._internal.chrom_attrs import build_chrom_attrs
 from ._internal.export_selection import (
     _iter_variant_slices,
@@ -25,6 +28,7 @@ from ._internal.export_selection import (
     _resolve_variant_indices_streaming,
     _subset_indices_in_requested_order,
 )
+from ._internal.pgenlib_io import PgenlibReader, PgenlibWriter, ensure_pgenlib_available
 from ._internal.plink import resolve_plink2_binary
 from ._internal.zarr_utils import _to_unicode_array
 from .concat import concat_hapstores
@@ -290,7 +294,7 @@ def _export_pgen_single(
     written = 0
     with pvar_path.open("w", encoding="utf-8") as pvar_handle:
         pvar_handle.write("#CHROM\tPOS\tID\tREF\tALT\n")
-        with PgenFastWriter(
+        with PgenlibWriter(
             pgen_path=pgen_path,
             sample_ct=len(sample_plan.selected_sample_ids),
             variant_ct=n_out_variants,
@@ -425,7 +429,7 @@ def ingest_pgen(
     blocks: list[np.ndarray] = []
     unphased_gt_count = 0
 
-    with PgenFastReader(
+    with PgenlibReader(
         pgen_path=pgen_path,
         pvar_path=pvar_path,
         sample_subset=reader_subset,
@@ -572,7 +576,7 @@ def _scan_pgen_metadata(
     alts: list[str] = []
     vids: list[str] = []
 
-    with PgenFastReader(pgen_path=pgen_path, pvar_path=pvar_path) as reader:
+    with PgenlibReader(pgen_path=pgen_path, pvar_path=pvar_path) as reader:
         n_variants = int(reader.variant_ct)
         if n_variants <= 0:
             raise ValueError(f"no variants found in {pgen_path}")
@@ -659,7 +663,7 @@ def _ingest_pgen_variant_range_to_store(
     if start < 0 or end <= start:
         raise ValueError(f"invalid shard range [{start}, {end})")
 
-    with PgenFastReader(
+    with PgenlibReader(
         pgen_path=Path(pgen_path),
         pvar_path=Path(pvar_path),
         sample_subset=reader_subset,
