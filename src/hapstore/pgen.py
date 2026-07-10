@@ -34,9 +34,9 @@ from ._internal.ingest_finalize import (
     _abort_streaming_finalize,
     _complete_streaming_finalize,
     _create_streaming_finalize_context,
-    _stream_finalize_write_shard,
+    _stream_finalize_write_arrays,
 )
-from ._internal.ingest_models import _PartitionPlan, _ShardArtifactMeta, _ShardSpec
+from ._internal.ingest_models import _PartitionPlan, _ShardSpec
 from ._internal.plink import resolve_plink2_binary
 from ._internal.zarr_utils import _to_unicode_array
 from .concat import concat_hapstores
@@ -154,17 +154,12 @@ def _stream_pgen_range_to_store(
     compression_level: int,
     store_genotypes: bool,
     attrs: dict | None,
-    scratch_dir: str | Path | None,
-    cleanup_intermediates: bool,
 ) -> HapStore:
-    """Stream a bounded PGEN variant range through ordered finalize artifacts."""
+    """Stream a bounded PGEN variant range directly into an ordered store."""
     if int(start_variant) < 0 or int(end_variant) <= int(start_variant):
         raise ValueError(f"invalid PGEN variant range [{start_variant}, {end_variant})")
     output_path = Path(output_zarr)
     output_existed_before = output_path.exists()
-    scratch_parent = output_path.parent if scratch_dir is None else Path(scratch_dir)
-    scratch_parent.mkdir(parents=True, exist_ok=True)
-    scratch_root = Path(tempfile.mkdtemp(prefix=f"{output_path.stem}.pgen_blocks_", dir=str(scratch_parent)))
     starts = list(range(int(start_variant), int(end_variant), int(variant_block_size)))
     shard_specs = [_ShardSpec(shard_index=i, start_bp=None, end_bp=None) for i in range(len(starts))]
     partition_plan = _PartitionPlan(partition_bp=int(variant_block_size), shards=shard_specs)
@@ -203,33 +198,19 @@ def _stream_pgen_range_to_store(
                     strict_biallelic=bool(strict_biallelic),
                     on_unphased_gt=on_unphased_gt,
                 )
-                artifact_path = scratch_root / f"block_{shard_index:06d}.npz"
-                np.savez(
-                    artifact_path,
-                    haplotypes=haps,
-                    positions=positions,
-                    ref=np.asarray(ref, dtype=str),
-                    alt=np.asarray(alt, dtype=str),
-                    vid=np.asarray(vid, dtype=str),
-                )
-                _stream_finalize_write_shard(
+                _stream_finalize_write_arrays(
                     ctx=ctx,
                     shard_index=int(shard_index),
-                    meta=_ShardArtifactMeta(
-                        shard_index=int(shard_index),
-                        start=None,
-                        end=None,
-                        artifact_path=str(artifact_path),
-                        n_variants=int(end - start),
-                        missing_ref_count=0,
-                        missing_alt_count=0,
-                        missing_vid_count=0,
-                        unphased_gt_count=int(unphased_count),
-                    ),
+                    haplotypes=haps,
+                    positions=positions,
+                    ref=ref,
+                    alt=alt,
+                    vid=vid,
                     chrom=chrom_key,
                     map_df=None,
                     started_at=time.perf_counter(),
                     missing_sentinel=int(_MISSING_SENTINEL),
+                    unphased_gt_count=int(unphased_count),
                 )
         payload = dict(attrs or {})
         payload.setdefault("source", "pgen")
@@ -240,6 +221,7 @@ def _stream_pgen_range_to_store(
             workers=1,
             partition_plan=partition_plan,
             missing_sentinel=int(_MISSING_SENTINEL),
+            parallel_mode="pgen_direct_streaming",
         )
     except Exception:
         _abort_streaming_finalize(ctx)
@@ -249,9 +231,6 @@ def _stream_pgen_range_to_store(
             else:
                 output_path.unlink(missing_ok=True)
         raise
-    finally:
-        if cleanup_intermediates:
-            shutil.rmtree(scratch_root, ignore_errors=True)
 
 
 def _cleanup_failed_pgen_export(func):
@@ -695,8 +674,6 @@ def ingest_pgen(
         compression_level=int(compression_level),
         store_genotypes=bool(store_genotypes),
         attrs=attrs,
-        scratch_dir=scratch_dir,
-        cleanup_intermediates=bool(cleanup_intermediates),
     )
 
 
@@ -828,8 +805,6 @@ def _ingest_pgen_variant_range_to_store(
         compression_level=int(compression_level),
         store_genotypes=bool(store_genotypes),
         attrs={"source": "pgen"},
-        scratch_dir=Path(output_zarr).parent,
-        cleanup_intermediates=True,
     )
     return str(Path(output_zarr)), int(out.attrs(chrom_key).get("extra", {}).get("unphased_gt_count", 0))
 

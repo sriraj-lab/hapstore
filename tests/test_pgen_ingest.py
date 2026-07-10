@@ -312,6 +312,36 @@ def test_ingest_pgen_parallel_matches_serial_roundtrip(tmp_path):
     assert parallel_extra["parallel_mode"] == "pgen_sharded_streaming"
 
 
+def test_ingest_pgen_streams_without_npz_block_artifacts(monkeypatch, tmp_path):
+    prefix = _write_triplet(
+        tmp_path / "direct_stream",
+        allele_rows=np.asarray(
+            [
+                [0, 1, 1, 1],
+                [1, 0, 0, 0],
+                [1, 1, 0, 1],
+            ],
+            dtype=np.int32,
+        ),
+        phase_rows=np.ones((3, 2), dtype=np.uint8),
+    )
+
+    def fail_savez(*args, **kwargs):
+        raise AssertionError("PGEN ingest should not serialize bounded blocks to NPZ")
+
+    monkeypatch.setattr(np, "savez", fail_savez)
+    out = ingest_pgen(
+        pgen_prefix=prefix,
+        output_zarr=tmp_path / "direct_stream.zarr",
+        chrom="1",
+        workers=1,
+        variant_block_size=1,
+    )
+
+    assert out.n_variants("1") == 3
+    assert out.attrs("1")["extra"]["parallel_mode"] == "pgen_direct_streaming"
+
+
 def test_read_sample_ids_parses_iid_only_psam_layout(tmp_path):
     psam_path = tmp_path / "chr5.psam"
     psam_path.write_text(

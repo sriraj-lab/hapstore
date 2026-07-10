@@ -255,6 +255,50 @@ def _stream_finalize_write_shard(
         alt = np.asarray(shard_data["alt"], dtype=object)
         vid = np.asarray(shard_data["vid"], dtype=object)
 
+    _stream_finalize_write_arrays(
+        ctx=ctx,
+        shard_index=shard_index,
+        haplotypes=h,
+        positions=positions,
+        ref=ref,
+        alt=alt,
+        vid=vid,
+        chrom=chrom,
+        map_df=map_df,
+        started_at=started_at,
+        missing_sentinel=missing_sentinel,
+        missing_ref_count=int(meta.missing_ref_count),
+        missing_alt_count=int(meta.missing_alt_count),
+        missing_vid_count=int(meta.missing_vid_count),
+        unphased_gt_count=int(meta.unphased_gt_count),
+    )
+
+
+def _stream_finalize_write_arrays(
+    ctx: _StreamingFinalizeContext,
+    shard_index: int,
+    haplotypes: np.ndarray,
+    positions: np.ndarray,
+    ref: np.ndarray,
+    alt: np.ndarray,
+    vid: np.ndarray,
+    chrom: str | int,
+    map_df,
+    started_at: float,
+    *,
+    missing_sentinel: int,
+    missing_ref_count: int = 0,
+    missing_alt_count: int = 0,
+    missing_vid_count: int = 0,
+    unphased_gt_count: int = 0,
+) -> None:
+    """Validate and append one in-memory variant block to a streaming store."""
+    h = np.asarray(haplotypes, dtype=np.uint8)
+    positions = np.asarray(positions, dtype=np.int64)
+    ref = np.asarray(ref, dtype=object)
+    alt = np.asarray(alt, dtype=object)
+    vid = np.asarray(vid, dtype=object)
+
     width = int(positions.shape[0])
     if h.shape != (ctx.n_haplotypes, width):
         raise ValueError(
@@ -293,10 +337,10 @@ def _stream_finalize_write_shard(
             ctx.has_missing = True
 
     ctx.offset = int(next_offset)
-    ctx.missing_ref_count += int(meta.missing_ref_count)
-    ctx.missing_alt_count += int(meta.missing_alt_count)
-    ctx.missing_vid_count += int(meta.missing_vid_count)
-    ctx.unphased_gt_count += int(meta.unphased_gt_count)
+    ctx.missing_ref_count += int(missing_ref_count)
+    ctx.missing_alt_count += int(missing_alt_count)
+    ctx.missing_vid_count += int(missing_vid_count)
+    ctx.unphased_gt_count += int(unphased_gt_count)
     logger.info(
         "Finalize shard %d/%d complete: variants=%d cumulative=%d elapsed=%.1fs",
         int(shard_index) + 1,
@@ -314,6 +358,7 @@ def _complete_streaming_finalize(
     partition_plan: _PartitionPlan,
     *,
     missing_sentinel: int,
+    parallel_mode: str = "staged_materialize_finalize",
 ) -> HapStore:
     final_variants = int(ctx.offset)
     ctx.hap_arr.resize((ctx.n_haplotypes, final_variants))
@@ -333,7 +378,7 @@ def _complete_streaming_finalize(
     payload["unphased_gt_count"] = int(ctx.unphased_gt_count)
     payload["parallel_workers"] = int(workers)
     payload["parallel_shards"] = int(ctx.n_shards)
-    payload["parallel_mode"] = "staged_materialize_finalize"
+    payload["parallel_mode"] = str(parallel_mode)
     payload["partition_bp"] = int(partition_plan.partition_bp)
     payload["chunk_variant_size"] = int(ctx.variant_chunk)
     payload["chunk_haplotype_size"] = int(ctx.hap_chunk)
