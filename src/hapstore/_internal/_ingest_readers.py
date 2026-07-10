@@ -197,7 +197,7 @@ def _extract_vcf_arrays_cyvcf2(
 
         for variant in iterator:
             found_for_contig = True
-            if variant.ALT is None or len(variant.ALT) != 1:
+            if variant.ALT is not None and len(variant.ALT) > 1:
                 continue
 
             pos = int(variant.POS)
@@ -206,7 +206,7 @@ def _extract_vcf_arrays_cyvcf2(
                 chrom=chrom_name,
                 pos=pos,
                 ref=variant.REF,
-                alt=variant.ALT[0],
+                alt="." if variant.ALT is None else variant.ALT[0],
                 on_missing_ref_alt=on_missing_ref_alt,
             )
             vid_i, mvid = _coerce_vid(chrom_name, pos, variant.ID, on_missing_vid)
@@ -227,17 +227,18 @@ def _extract_vcf_arrays_cyvcf2(
                     a1 = g[1]
                     phased = bool(g[2]) if len(g) >= 3 else True
 
-                    if not phased:
-                        unphased_gt_count += 1
-                        if on_unphased_gt == "error":
-                            raise ValueError(
-                                f"unphased genotype at {chrom_name}:{pos} sample_index={int(sample_i)}"
-                            )
+                    if a0 is None or a1 is None or int(a0) < 0 or int(a1) < 0:
                         hap[2 * out_i] = _MISSING_SENTINEL
                         hap[2 * out_i + 1] = _MISSING_SENTINEL
                         continue
 
-                    if a0 is None or a1 is None or int(a0) < 0 or int(a1) < 0:
+                    if not phased and int(a0) != int(a1):
+                        unphased_gt_count += 1
+                        if on_unphased_gt == "error":
+                            raise ValueError(
+                                "unphased genotype is heterozygous at "
+                                f"{chrom_name}:{pos} sample_index={int(sample_i)}"
+                            )
                         hap[2 * out_i] = _MISSING_SENTINEL
                         hap[2 * out_i + 1] = _MISSING_SENTINEL
                         continue
@@ -300,11 +301,11 @@ def _extract_vcf_arrays_pysam(
         try:
             iterator = vcf.fetch(contig)
         except Exception:
-            continue
+            iterator = (record for record in vcf.fetch() if str(record.contig) == str(contig))
 
         for record in iterator:
             found_for_contig = True
-            if record.alts is None or len(record.alts) != 1:
+            if record.alts is not None and len(record.alts) > 1:
                 continue
 
             pos = int(record.pos)
@@ -313,7 +314,7 @@ def _extract_vcf_arrays_pysam(
                 chrom=chrom_name,
                 pos=pos,
                 ref=record.ref,
-                alt=record.alts[0],
+                alt="." if record.alts is None else record.alts[0],
                 on_missing_ref_alt=on_missing_ref_alt,
             )
             vid_i, mvid = _coerce_vid(chrom_name, pos, record.id, on_missing_vid)
@@ -330,18 +331,19 @@ def _extract_vcf_arrays_pysam(
                     hap[2 * out_i + 1] = _MISSING_SENTINEL
                     continue
 
-                if not phased:
-                    unphased_gt_count += 1
-                    if on_unphased_gt == "error":
-                        raise ValueError(
-                            f"unphased genotype at {chrom_name}:{pos} sample={sample_name}"
-                        )
+                a0, a1 = gt[0], gt[1]
+                if a0 is None or a1 is None or int(a0) < 0 or int(a1) < 0:
                     hap[2 * out_i] = _MISSING_SENTINEL
                     hap[2 * out_i + 1] = _MISSING_SENTINEL
                     continue
 
-                a0, a1 = gt[0], gt[1]
-                if a0 is None or a1 is None or int(a0) < 0 or int(a1) < 0:
+                if not phased and int(a0) != int(a1):
+                    unphased_gt_count += 1
+                    if on_unphased_gt == "error":
+                        raise ValueError(
+                            "unphased genotype is heterozygous at "
+                            f"{chrom_name}:{pos} sample={sample_name}"
+                        )
                     hap[2 * out_i] = _MISSING_SENTINEL
                     hap[2 * out_i + 1] = _MISSING_SENTINEL
                     continue
@@ -428,6 +430,9 @@ def _extract_vcf_arrays_text(
             if "," in alt_field:
                 continue
 
+            format_fields = fields[8].split(":")
+            gt_index = format_fields.index("GT") if "GT" in format_fields else None
+
             pos = int(fields[1])
             ref_i, alt_i, mref, malt = _coerce_ref_alt(
                 chrom=contig,
@@ -444,25 +449,26 @@ def _extract_vcf_arrays_text(
             hap = np.empty(2 * subset_idx.shape[0], dtype=np.uint8)
             for out_i, sample_i in enumerate(subset_idx):
                 gt_field = fields[9 + int(sample_i)]
-                parsed = _parse_text_gt(gt_field)
+                parsed = None if gt_index is None else _parse_text_gt(gt_field, gt_index=gt_index)
                 if parsed is None:
                     hap[2 * out_i] = _MISSING_SENTINEL
                     hap[2 * out_i + 1] = _MISSING_SENTINEL
                     continue
 
                 a0, a1, phased = parsed
-                if not phased:
-                    unphased_gt_count += 1
-                    if on_unphased_gt == "error":
-                        sample_name = header_samples[int(sample_i)]
-                        raise ValueError(
-                            f"unphased genotype at {contig}:{pos} sample={sample_name}"
-                        )
+                if a0 is None or a1 is None:
                     hap[2 * out_i] = _MISSING_SENTINEL
                     hap[2 * out_i + 1] = _MISSING_SENTINEL
                     continue
 
-                if a0 is None or a1 is None:
+                if not phased and int(a0) != int(a1):
+                    unphased_gt_count += 1
+                    if on_unphased_gt == "error":
+                        sample_name = header_samples[int(sample_i)]
+                        raise ValueError(
+                            "unphased genotype is heterozygous at "
+                            f"{contig}:{pos} sample={sample_name}"
+                        )
                     hap[2 * out_i] = _MISSING_SENTINEL
                     hap[2 * out_i + 1] = _MISSING_SENTINEL
                     continue
@@ -496,8 +502,11 @@ def _extract_vcf_arrays_text(
     )
 
 
-def _parse_text_gt(gt_field: str) -> tuple[int | None, int | None, bool] | None:
-    token = gt_field.split(":", 1)[0]
+def _parse_text_gt(gt_field: str, *, gt_index: int) -> tuple[int | None, int | None, bool] | None:
+    fields = gt_field.split(":")
+    if int(gt_index) >= len(fields):
+        return None
+    token = fields[int(gt_index)]
     if "|" in token:
         parts = token.split("|")
         phased = True

@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import logging
 import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -290,7 +291,7 @@ def concat_hapstores(
     output_store: str | Path,
     chrom: str | int,
     axis: Axis = "samples",
-    validate: ValidateMode = "spot",
+    validate: ValidateMode = "full",
     n_workers: int = 1,
     compression_level: int | None = 3,
     chunk_variant_size: int | None = None,
@@ -321,49 +322,63 @@ def concat_hapstores(
     output_path = Path(output_store)
     tmp_path = Path(str(output_path) + str(tmp_suffix))
     _prepare_output_paths(output_path=output_path, tmp_path=tmp_path, overwrite=overwrite)
-
-    sources = _validate_and_collect_inputs(input_stores=input_stores, chrom_key=chrom_key)
-    resolved = _resolve_layout(
-        sources=sources,
-        chrom_key=chrom_key,
-        compression_level=compression_level,
-        chunk_variant_size=chunk_variant_size,
-        chunk_haplotype_size=chunk_haplotype_size,
-        chunk_sample_size=chunk_sample_size,
-        store_genotypes=store_genotypes,
-    )
-
-    tmp_store = HapStore(tmp_path, mode="w")
-    if axis_norm == "samples":
-        _concat_samples_into_store(
+    try:
+        sources = _validate_and_collect_inputs(input_stores=input_stores, chrom_key=chrom_key)
+        resolved = _resolve_layout(
             sources=sources,
-            out=tmp_store,
             chrom_key=chrom_key,
-            validate=validate_norm,
-            n_workers=min(int(n_workers), len(sources)),
-            strict_variant_ids=bool(strict_variant_ids),
-            store_genotypes=bool(store_genotypes),
-            resolved=resolved,
-            attrs=attrs,
+            compression_level=compression_level,
+            chunk_variant_size=chunk_variant_size,
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            store_genotypes=store_genotypes,
         )
-    else:
-        _concat_variants_into_store(
-            sources=sources,
-            out=tmp_store,
-            chrom_key=chrom_key,
-            validate=validate_norm,
-            n_workers=min(int(n_workers), len(sources)),
-            forbid_duplicate_variants=bool(forbid_duplicate_variants),
-            store_genotypes=bool(store_genotypes),
-            resolved=resolved,
-            attrs=attrs,
-        )
+        effective_workers = min(int(n_workers), len(sources))
+        if axis_norm == "variants" and effective_workers > 1:
+            logging.getLogger(__name__).info(
+                "Falling back to serial variant-axis concat because source boundaries can share output chunks"
+            )
+            effective_workers = 1
+        if axis_norm == "samples" and store_genotypes and effective_workers > 1:
+            logging.getLogger(__name__).info(
+                "Falling back to serial sample-axis concat while materializing genotypes"
+            )
+            effective_workers = 1
 
-    del tmp_store
-    gc.collect()
+        tmp_store = HapStore(tmp_path, mode="w")
+        if axis_norm == "samples":
+            _concat_samples_into_store(
+                sources=sources,
+                out=tmp_store,
+                chrom_key=chrom_key,
+                validate=validate_norm,
+                n_workers=effective_workers,
+                strict_variant_ids=bool(strict_variant_ids),
+                store_genotypes=bool(store_genotypes),
+                resolved=resolved,
+                attrs=attrs,
+            )
+        else:
+            _concat_variants_into_store(
+                sources=sources,
+                out=tmp_store,
+                chrom_key=chrom_key,
+                validate=validate_norm,
+                n_workers=effective_workers,
+                forbid_duplicate_variants=bool(forbid_duplicate_variants),
+                store_genotypes=bool(store_genotypes),
+                resolved=resolved,
+                attrs=attrs,
+            )
 
-    tmp_path.replace(output_path)
-    return HapStore(output_path, mode="r")
+        del tmp_store
+        gc.collect()
+        _promote_concat_output(output_path=output_path, tmp_path=tmp_path, overwrite=overwrite)
+        return HapStore(output_path, mode="r")
+    except Exception:
+        if tmp_path.exists():
+            _rm_tree_or_file(tmp_path)
+        raise
 
 
 def _normalize_axis(axis: Axis) -> Literal["samples", "variants"]:
@@ -388,10 +403,26 @@ def _prepare_output_paths(*, output_path: Path, tmp_path: Path, overwrite: bool)
             raise FileExistsError(f"tmp output already exists: {tmp_path}")
         return
 
-    if output_path.exists():
-        _rm_tree_or_file(output_path)
     if tmp_path.exists():
         _rm_tree_or_file(tmp_path)
+
+
+def _promote_concat_output(*, output_path: Path, tmp_path: Path, overwrite: bool) -> None:
+    if not output_path.exists():
+        tmp_path.replace(output_path)
+        return
+    if not overwrite:
+        raise FileExistsError(f"output_store already exists: {output_path}")
+    backup_path = output_path.with_name(f"{output_path.name}.backup-{uuid.uuid4().hex}")
+    output_path.replace(backup_path)
+    try:
+        tmp_path.replace(output_path)
+    except Exception:
+        backup_path.replace(output_path)
+        raise
+    finally:
+        if backup_path.exists():
+            _rm_tree_or_file(backup_path)
 
 
 def _rm_tree_or_file(path: Path) -> None:
@@ -687,6 +718,7 @@ def _concat_variants_into_store(
 
     if validate == "full" and forbid_duplicate_variants:
         _enforce_no_duplicate_vids_full(sources)
+        _enforce_no_duplicate_variant_keys_full(sources, variant_chunk=resolved.variant_chunk_attr)
 
     n_samples = int(sources[0].n_samples)
     n_haps = int(sources[0].n_haplotypes)
@@ -942,9 +974,9 @@ def _enforce_pos_nonoverlap_boundary(sources: Sequence[_InputChrom]) -> None:
         right = sources[i + 1].variants_group["pos"]
         left_last = int(np.asarray(left[-1], dtype=np.int64))
         right_first = int(np.asarray(right[0], dtype=np.int64))
-        if left_last >= right_first:
+        if left_last > right_first:
             raise ValueError(
-                "variant position ranges overlap or are not strictly increasing across inputs: "
+                "variant position ranges are not non-decreasing across inputs: "
                 f"store[{i}] last_pos={left_last}, store[{i+1}] first_pos={right_first}"
             )
 
@@ -954,10 +986,36 @@ def _enforce_no_duplicate_vids_full(sources: Sequence[_InputChrom]) -> None:
     for idx, src in enumerate(sources):
         vids = np.asarray(src.variants_group["vid"][:], dtype=object).tolist()
         for v in vids:
-            text = str(v)
+            text = str(v).strip()
+            if text in {"", "."}:
+                continue
             if text in seen:
                 raise ValueError(
                     "duplicate variant IDs across input stores are not allowed for variant concat; "
                     f"first duplicate={text!r} at store[{idx}]={src.path}"
                 )
             seen.add(text)
+
+
+def _enforce_no_duplicate_variant_keys_full(
+    sources: Sequence[_InputChrom],
+    *,
+    variant_chunk: int,
+) -> None:
+    seen: set[tuple[int, str, str]] = set()
+    block_size = max(1, int(variant_chunk))
+    for src_index, src in enumerate(sources):
+        variants = src.variants_group
+        for start in range(0, int(src.n_variants), block_size):
+            end = min(int(start) + block_size, int(src.n_variants))
+            positions = np.asarray(variants["pos"][start:end], dtype=np.int64)
+            refs = _to_unicode_array(np.asarray(variants["ref"][start:end], dtype=object))
+            alts = _to_unicode_array(np.asarray(variants["alt"][start:end], dtype=object))
+            for offset, (pos, ref, alt) in enumerate(zip(positions, refs, alts, strict=True)):
+                key = (int(pos), str(ref), str(alt))
+                if key in seen:
+                    raise ValueError(
+                        "duplicate variant identity across input stores for variant concat: "
+                        f"key={key!r}, store[{src_index}]={src.path}, index={start + offset}"
+                    )
+                seen.add(key)

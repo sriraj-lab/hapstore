@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,6 +27,29 @@ from ._internal.zarr_utils import _to_unicode_array
 from .store import HapStore, _MISSING_SENTINEL
 
 
+def _cleanup_failed_vcf_export(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        output_vcf = kwargs.get("output_vcf", args[1] if len(args) > 1 else None)
+        if output_vcf is None:
+            raise TypeError("export_vcf requires output_vcf")
+        output = Path(output_vcf)
+        plain = output.with_suffix("") if output.suffix == ".gz" else output
+        compressed = output if output.suffix == ".gz" else Path(f"{output}.gz")
+        try:
+            result = func(*args, **kwargs)
+            if not result.exists() or result.stat().st_size <= 0:
+                raise ValueError(f"VCF export did not produce a non-empty output: {result}")
+            return result
+        except Exception:
+            for path in (plain, compressed, Path(f"{compressed}.tbi"), Path(f"{compressed}.csi")):
+                path.unlink(missing_ok=True)
+            raise
+
+    return wrapped
+
+
+@_cleanup_failed_vcf_export
 def export_vcf(
     store_path: str | Path,
     output_vcf: str | Path,
@@ -208,7 +232,6 @@ def _export_vcf_via_pgen(
         if not variant_indices:
             raise ValueError("variant_ids resolved to an empty variant set")
 
-    merged_prefix = Path(f"{export_prefix}.merged_pgen")
     shard_prefixes: list[Path] = []
 
     tmp_root = None
@@ -217,6 +240,7 @@ def _export_vcf_via_pgen(
         work_dir = tmp_root
     else:
         work_dir = export_prefix.parent
+    merged_prefix = work_dir / f"{export_prefix.name}.merged_pgen"
 
     try:
         if int(n_shards) == 1:

@@ -192,6 +192,58 @@ def test_ingest_vcf_unphased_policy(tmp_path):
         )
 
 
+def test_ingest_vcf_preserves_unphased_homozygotes(tmp_path):
+    vcf = write_text_vcf(
+        tmp_path / "unphased_homos.vcf",
+        rows=[("chr1", 100, "rs1", "A", "G", ["0/0", "1/1"])],
+    )
+
+    store = ingest_vcf(
+        vcf_path=vcf,
+        output_zarr=tmp_path / "unphased_homos.zarr",
+        chrom="1",
+        backend="text",
+    )
+    np.testing.assert_array_equal(
+        store.haplotypes("1"),
+        np.asarray([[0], [0], [1], [1]], dtype=np.uint8),
+    )
+    assert store.attrs("1")["extra"]["unphased_gt_count"] == 0
+
+
+def test_ingest_vcf_multiallelic_policy_and_format_gt_position(tmp_path):
+    vcf = tmp_path / "multiallelic.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n"
+        "chr1\t100\tmulti\tA\tG,T\t.\tPASS\t.\tDP:GT\t12:0|1\n"
+        "chr1\t200\trs2\tC\tT\t.\tPASS\t.\tDP:GT\t9:0|1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="multiallelic"):
+        ingest_vcf(
+            vcf_path=vcf,
+            output_zarr=tmp_path / "strict_multi.zarr",
+            chrom="1",
+            backend="text",
+        )
+
+    store = ingest_vcf(
+        vcf_path=vcf,
+        output_zarr=tmp_path / "skip_multi.zarr",
+        chrom="1",
+        backend="text",
+        on_multiallelic="skip",
+    )
+    assert store.variant_positions("1").tolist() == [200]
+    np.testing.assert_array_equal(store.haplotypes("1"), np.asarray([[0], [1]], dtype=np.uint8))
+    extra = store.attrs("1")["extra"]
+    assert extra["multiallelic_skipped_count"] == 1
+    assert extra["records_seen"] == 2
+    assert extra["records_kept"] == 1
+
+
 def test_ingest_vcf_missing_variant_info_policies(tmp_path):
     vcf = write_text_vcf(
         tmp_path / "missing_info.vcf",
@@ -235,6 +287,9 @@ def test_ingest_vcf_auto_prefers_plink2_bridge(tmp_path, monkeypatch):
 
     def fake_bridge(**kwargs):
         called["bridge"] = True
+        bridge_attrs = dict(kwargs["attrs"])
+        bridge_attrs.setdefault("source", "vcf")
+        bridge_attrs["ingest_backend"] = "plink2_bridge"
         return ingest_arrays(
             output_zarr=kwargs["output_zarr"],
             chrom=kwargs["chrom"],
@@ -244,10 +299,11 @@ def test_ingest_vcf_auto_prefers_plink2_bridge(tmp_path, monkeypatch):
             ref=["A"],
             alt=["G"],
             vid=["rs1"],
-            attrs={"source": "vcf", "ingest_backend": "plink2_bridge"},
+            attrs=bridge_attrs,
         )
 
     monkeypatch.setattr(ingest_mod, "_ingest_vcf_via_plink2_bridge", fake_bridge)
+    monkeypatch.setattr(ingest_mod, "resolve_plink2_binary", lambda _path: tmp_path / "plink2")
     monkeypatch.setattr(
         ingest_mod,
         "_extract_vcf_arrays",
@@ -259,6 +315,7 @@ def test_ingest_vcf_auto_prefers_plink2_bridge(tmp_path, monkeypatch):
     assert called["bridge"] is True
     assert store.attrs("1")["source"] == "vcf"
     assert store.attrs("1")["extra"]["ingest_backend"] == "plink2_bridge"
+    assert store.attrs("1")["extra"]["ingest_backend_requested"] == "auto"
 
 
 def test_ingest_vcf_auto_falls_back_when_bridge_unavailable(tmp_path, monkeypatch):
@@ -271,8 +328,8 @@ def test_ingest_vcf_auto_falls_back_when_bridge_unavailable(tmp_path, monkeypatc
 
     monkeypatch.setattr(
         ingest_mod,
-        "_ingest_vcf_via_plink2_bridge",
-        lambda **kwargs: (_ for _ in ()).throw(FileNotFoundError("plink2 missing")),
+        "resolve_plink2_binary",
+        lambda _path: (_ for _ in ()).throw(FileNotFoundError("plink2 missing")),
     )
 
     def fake_extract(**kwargs):
@@ -295,6 +352,8 @@ def test_ingest_vcf_auto_falls_back_when_bridge_unavailable(tmp_path, monkeypatc
 
     assert store.n_variants("1") == 1
     assert store.attrs("1").get("source") is None
+    assert store.attrs("1")["extra"]["ingest_backend"] == "pysam"
+    assert "plink2 missing" in store.attrs("1")["extra"]["auto_fallback_reason"]
 
 
 def test_ingest_vcf_plink2_bridge_backfills_genetic_positions(tmp_path, monkeypatch):

@@ -215,6 +215,20 @@ def test_concat_variants_roundtrip(tmp_path):
     np.testing.assert_array_equal(out.haplotypes("chr21"), expected)
     np.testing.assert_array_equal(out.variant_positions("chr21"), np.asarray([100, 200, 300, 400, 500], dtype=np.int64))
 
+    parallel_out = tmp_path / "concat_vars_parallel.zarr"
+    concat_hapstores(
+        input_stores=[left.path, right.path],
+        output_store=parallel_out,
+        chrom="chr21",
+        axis="variants",
+        validate="full",
+        n_workers=2,
+        chunk_variant_size=2,
+        chunk_haplotype_size=4,
+        compression_level=3,
+    )
+    np.testing.assert_array_equal(HapStore(parallel_out, mode="r").haplotypes("chr21"), expected)
+
 
 def test_concat_variants_duplicate_vid_raises_full_validate(tmp_path):
     sample_ids = np.asarray(["s1", "s2"], dtype=object)

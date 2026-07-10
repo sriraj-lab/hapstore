@@ -13,6 +13,7 @@ Backend = Literal["auto", "cyvcf2", "pysam", "text", "plink2_bridge"]
 MissingRefAltPolicy = Literal["error", "dot"]
 MissingVidPolicy = Literal["dot", "error"]
 UnphasedPolicy = Literal["missing", "error"]
+MultiallelicPolicy = Literal["error", "skip"]
 
 
 @dataclass

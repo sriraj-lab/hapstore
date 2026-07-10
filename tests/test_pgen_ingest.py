@@ -304,7 +304,12 @@ def test_ingest_pgen_parallel_matches_serial_roundtrip(tmp_path):
     np.testing.assert_array_equal(serial.haplotypes("1"), parallel.haplotypes("1"))
     assert serial.variant_positions("1").tolist() == parallel.variant_positions("1").tolist()
     assert serial.sample_ids("1") == parallel.sample_ids("1")
-    assert serial.attrs("1").get("extra") == parallel.attrs("1").get("extra")
+    assert serial.attrs("1")["source"] == parallel.attrs("1")["source"] == "pgen"
+    serial_extra = serial.attrs("1").get("extra", {})
+    parallel_extra = parallel.attrs("1").get("extra", {})
+    assert serial_extra["unphased_gt_count"] == parallel_extra["unphased_gt_count"] == 0
+    assert serial_extra["pgen_variant_block_size"] == parallel_extra["pgen_variant_block_size"] == 2
+    assert parallel_extra["parallel_mode"] == "pgen_sharded_streaming"
 
 
 def test_read_sample_ids_parses_iid_only_psam_layout(tmp_path):

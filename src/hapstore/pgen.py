@@ -7,6 +7,7 @@ handling is isolated in hapstore._internal.pgenlib_io.
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import multiprocessing as mp
 from pathlib import Path
 import shutil
@@ -29,16 +30,251 @@ from ._internal.export_selection import (
     _subset_indices_in_requested_order,
 )
 from ._internal.pgenlib_io import PgenlibReader, PgenlibWriter, ensure_pgenlib_available
+from ._internal.ingest_finalize import (
+    _abort_streaming_finalize,
+    _complete_streaming_finalize,
+    _create_streaming_finalize_context,
+    _stream_finalize_write_shard,
+)
+from ._internal.ingest_models import _PartitionPlan, _ShardArtifactMeta, _ShardSpec
 from ._internal.plink import resolve_plink2_binary
 from ._internal.zarr_utils import _to_unicode_array
 from .concat import concat_hapstores
-from .ingest import ingest_arrays
 from .store import HapStore, _MISSING_SENTINEL
 
 PartialMissingPolicy = Literal["error", "missing"]
 UnphasedPolicy = Literal["error", "missing"]
 
 
+def _read_pgen_haplotype_block(
+    *,
+    reader: PgenlibReader,
+    chrom_key: str,
+    start: int,
+    end: int,
+    hap_reorder: np.ndarray | None,
+    strict_biallelic: bool,
+    on_unphased_gt: UnphasedPolicy,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Read one PGEN variant block into HapStore's haplotype-major representation."""
+    width = int(end - start)
+    positions = np.empty(width, dtype=np.int64)
+    refs = np.empty(width, dtype=object)
+    alts = np.empty(width, dtype=object)
+    vids = np.empty(width, dtype=object)
+    for rel_idx, variant_idx in enumerate(range(int(start), int(end))):
+        var_chrom = normalize_chrom(reader.variant_chrom(variant_idx), prefix=True)
+        if var_chrom != chrom_key:
+            raise ValueError(
+                f"pvar chromosome mismatch at variant {variant_idx}: {var_chrom!r} vs requested {chrom_key!r}"
+            )
+        allele_ct = int(reader.allele_ct(variant_idx))
+        if strict_biallelic and allele_ct > 2:
+            raise ValueError(
+                f"non-biallelic variant encountered at {chrom_key}:{reader.variant_pos(variant_idx)} "
+                f"(allele_ct={allele_ct})"
+            )
+        pos = int(reader.variant_pos(variant_idx))
+        ref, alt = _normalize_ref_alt_for_pvar(
+            ref=reader.allele_code(variant_idx, 0),
+            alt=reader.allele_code(variant_idx, 1) if allele_ct >= 2 else ".",
+            strict_biallelic=bool(strict_biallelic),
+            chrom_key=chrom_key,
+            pos=pos,
+        )
+        raw_vid = reader.variant_id(variant_idx).strip()
+        positions[rel_idx] = pos
+        refs[rel_idx] = ref
+        alts[rel_idx] = alt
+        vids[rel_idx] = raw_vid if raw_vid not in {"", "."} else "."
+
+    allele_block = np.empty((width, 2 * int(reader.sample_ct)), dtype=np.int32, order="C")
+    phase_block = np.empty((width, int(reader.sample_ct)), dtype=np.uint8, order="C")
+    reader.read_alleles_and_phasepresent_range(int(start), int(end), allele_block, phase_block)
+
+    valid = allele_block >= 0
+    if strict_biallelic and np.any(allele_block[valid] > 1):
+        bad = np.argwhere((allele_block >= 0) & (allele_block > 1))[0]
+        raise ValueError(
+            "non-biallelic allele code encountered while ingesting "
+            f"{chrom_key}:{int(positions[int(bad[0])])}"
+        )
+
+    a0 = allele_block[:, 0::2]
+    a1 = allele_block[:, 1::2]
+    missing = (a0 < 0) | (a1 < 0)
+    unphased_het = (phase_block == 0) & (~missing) & (a0 != a1)
+    unphased_gt_count = int(np.sum(unphased_het))
+    if unphased_gt_count:
+        if on_unphased_gt == "error":
+            first = np.argwhere(unphased_het)[0]
+            raise ValueError(
+                "unphased heterozygous genotype encountered while ingesting PGEN "
+                f"(variant={chrom_key}:{int(positions[int(first[0])])}, sample_index={int(first[1])})"
+            )
+        a0[unphased_het] = -9
+        a1[unphased_het] = -9
+
+    pair_missing = (a0 < 0) | (a1 < 0)
+    a0[pair_missing] = -9
+    a1[pair_missing] = -9
+    haplotypes = np.where(allele_block.T < 0, _MISSING_SENTINEL, allele_block.T).astype(
+        np.uint8,
+        copy=False,
+    )
+    if hap_reorder is not None:
+        haplotypes = haplotypes[hap_reorder, :]
+    return (
+        np.ascontiguousarray(haplotypes),
+        positions,
+        refs,
+        alts,
+        vids,
+        unphased_gt_count,
+    )
+
+
+def _stream_pgen_range_to_store(
+    *,
+    pgen_path: Path,
+    pvar_path: Path,
+    output_zarr: str | Path,
+    chrom_key: str,
+    selected_sample_ids: list[str],
+    reader_subset: np.ndarray | None,
+    hap_reorder: np.ndarray | None,
+    start_variant: int,
+    end_variant: int,
+    variant_block_size: int,
+    on_unphased_gt: UnphasedPolicy,
+    strict_biallelic: bool,
+    chunk_variant_size: int,
+    chunk_haplotype_size: int | None,
+    chunk_sample_size: int | None,
+    compression_level: int,
+    store_genotypes: bool,
+    attrs: dict | None,
+    scratch_dir: str | Path | None,
+    cleanup_intermediates: bool,
+) -> HapStore:
+    """Stream a bounded PGEN variant range through ordered finalize artifacts."""
+    if int(start_variant) < 0 or int(end_variant) <= int(start_variant):
+        raise ValueError(f"invalid PGEN variant range [{start_variant}, {end_variant})")
+    output_path = Path(output_zarr)
+    output_existed_before = output_path.exists()
+    scratch_parent = output_path.parent if scratch_dir is None else Path(scratch_dir)
+    scratch_parent.mkdir(parents=True, exist_ok=True)
+    scratch_root = Path(tempfile.mkdtemp(prefix=f"{output_path.stem}.pgen_blocks_", dir=str(scratch_parent)))
+    starts = list(range(int(start_variant), int(end_variant), int(variant_block_size)))
+    shard_specs = [_ShardSpec(shard_index=i, start_bp=None, end_bp=None) for i in range(len(starts))]
+    partition_plan = _PartitionPlan(partition_bp=int(variant_block_size), shards=shard_specs)
+    ctx = None
+    try:
+        ctx = _create_streaming_finalize_context(
+            output_zarr=output_path,
+            chrom=chrom_key,
+            subset_ids=np.asarray(selected_sample_ids, dtype=object),
+            shard_specs=shard_specs,
+            map_df=None,
+            store_genotypes=bool(store_genotypes),
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=int(compression_level),
+        )
+        with PgenlibReader(
+            pgen_path=pgen_path,
+            pvar_path=pvar_path,
+            sample_subset=reader_subset,
+        ) as reader:
+            if int(reader.sample_ct) != len(selected_sample_ids):
+                raise ValueError(
+                    "PGEN sample subset mismatch: "
+                    f"reader={reader.sample_ct}, selected={len(selected_sample_ids)}"
+                )
+            for shard_index, start in enumerate(starts):
+                end = min(int(end_variant), int(start) + int(variant_block_size))
+                haps, positions, ref, alt, vid, unphased_count = _read_pgen_haplotype_block(
+                    reader=reader,
+                    chrom_key=chrom_key,
+                    start=int(start),
+                    end=int(end),
+                    hap_reorder=hap_reorder,
+                    strict_biallelic=bool(strict_biallelic),
+                    on_unphased_gt=on_unphased_gt,
+                )
+                artifact_path = scratch_root / f"block_{shard_index:06d}.npz"
+                np.savez(
+                    artifact_path,
+                    haplotypes=haps,
+                    positions=positions,
+                    ref=np.asarray(ref, dtype=str),
+                    alt=np.asarray(alt, dtype=str),
+                    vid=np.asarray(vid, dtype=str),
+                )
+                _stream_finalize_write_shard(
+                    ctx=ctx,
+                    shard_index=int(shard_index),
+                    meta=_ShardArtifactMeta(
+                        shard_index=int(shard_index),
+                        start=None,
+                        end=None,
+                        artifact_path=str(artifact_path),
+                        n_variants=int(end - start),
+                        missing_ref_count=0,
+                        missing_alt_count=0,
+                        missing_vid_count=0,
+                        unphased_gt_count=int(unphased_count),
+                    ),
+                    chrom=chrom_key,
+                    map_df=None,
+                    started_at=time.perf_counter(),
+                    missing_sentinel=int(_MISSING_SENTINEL),
+                )
+        payload = dict(attrs or {})
+        payload.setdefault("source", "pgen")
+        payload["pgen_variant_block_size"] = int(variant_block_size)
+        return _complete_streaming_finalize(
+            ctx=ctx,
+            attrs=payload,
+            workers=1,
+            partition_plan=partition_plan,
+            missing_sentinel=int(_MISSING_SENTINEL),
+        )
+    except Exception:
+        _abort_streaming_finalize(ctx)
+        if not output_existed_before and output_path.exists():
+            if output_path.is_dir():
+                shutil.rmtree(output_path, ignore_errors=True)
+            else:
+                output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if cleanup_intermediates:
+            shutil.rmtree(scratch_root, ignore_errors=True)
+
+
+def _cleanup_failed_pgen_export(func):
+    """Ensure a failed public export cannot leave a plausible partial triplet."""
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        out_prefix = kwargs.get("out_prefix", args[1] if len(args) > 1 else None)
+        if out_prefix is None:
+            raise TypeError("export_pgen requires out_prefix")
+        prefix = _normalize_pgen_prefix(out_prefix)
+        try:
+            result = func(*args, **kwargs)
+            _validate_pgen_triplet(prefix)
+            return result
+        except Exception:
+            _remove_pgen_triplet(prefix)
+            raise
+
+    return wrapped
+
+
+@_cleanup_failed_pgen_export
 def export_pgen(
     store_path: str | Path,
     out_prefix: str | Path,
@@ -61,6 +297,8 @@ def export_pgen(
 
     Current scope is diploid, phased, biallelic hardcalls only.
     """
+    if not strict_biallelic:
+        raise ValueError("HapStore PGEN export supports biallelic hardcalls only; strict_biallelic=False is unsupported")
     if int(n_workers) <= 0:
         raise ValueError(f"n_workers must be positive, got {n_workers}")
     if int(plink2_workers) <= 0:
@@ -373,11 +611,15 @@ def ingest_pgen(
     compression_level: int = 3,
     store_genotypes: bool = False,
     attrs: dict | None = None,
+    scratch_dir: str | Path | None = None,
+    cleanup_intermediates: bool = True,
 ) -> HapStore:
     """Ingest one chromosome from PGEN triplet into HapStore.
 
     Current scope is diploid, phased, biallelic hardcalls only.
     """
+    if not strict_biallelic:
+        raise ValueError("HapStore PGEN ingest supports biallelic hardcalls only; strict_biallelic=False is unsupported")
     ensure_pgenlib_available()
     if int(variant_block_size) <= 0:
         raise ValueError(f"variant_block_size must be positive, got {variant_block_size}")
@@ -400,6 +642,17 @@ def ingest_pgen(
         sample_mask=sample_plan.sample_mask,
     )
 
+    with PgenlibReader(
+        pgen_path=pgen_path,
+        pvar_path=pvar_path,
+        sample_subset=reader_subset,
+    ) as reader:
+        n_variants = int(reader.variant_ct)
+        if n_variants <= 0:
+            raise ValueError(f"no variants found in {prefix}.pgen")
+        if int(reader.sample_ct) <= 0:
+            raise ValueError(f"no samples selected from {prefix}.psam")
+
     if int(workers) > 1:
         return _ingest_pgen_parallel(
             pgen_path=pgen_path,
@@ -419,129 +672,31 @@ def ingest_pgen(
             compression_level=int(compression_level),
             store_genotypes=bool(store_genotypes),
             attrs=attrs,
+            scratch_dir=scratch_dir,
+            cleanup_intermediates=bool(cleanup_intermediates),
         )
 
-    positions: list[int] = []
-    refs: list[str] = []
-    alts: list[str] = []
-    vids: list[str] = []
-
-    blocks: list[np.ndarray] = []
-    unphased_gt_count = 0
-
-    with PgenlibReader(
+    return _stream_pgen_range_to_store(
         pgen_path=pgen_path,
         pvar_path=pvar_path,
-        sample_subset=reader_subset,
-    ) as reader:
-        n_variants = int(reader.variant_ct)
-        n_samples_reader = int(reader.sample_ct)
-
-        if n_variants <= 0:
-            raise ValueError(f"no variants found in {prefix}.pgen")
-        if n_samples_reader <= 0:
-            raise ValueError(f"no samples selected from {prefix}.psam")
-
-        for vidx in range(n_variants):
-            var_chrom = normalize_chrom(reader.variant_chrom(vidx), prefix=True)
-            if var_chrom != chrom_key:
-                raise ValueError(
-                    f"pvar chromosome mismatch at variant {vidx}: {var_chrom!r} vs requested {chrom_key!r}"
-                )
-
-            allele_ct = int(reader.allele_ct(vidx))
-            ref_i = reader.allele_code(vidx, 0)
-            alt_i = reader.allele_code(vidx, 1) if allele_ct >= 2 else "."
-            if strict_biallelic and allele_ct > 2:
-                raise ValueError(
-                    f"non-biallelic variant encountered at {chrom_key}:{reader.variant_pos(vidx)} "
-                    f"(allele_ct={allele_ct})"
-                )
-
-            ref_i, alt_i = _normalize_ref_alt_for_pvar(
-                ref=ref_i,
-                alt=alt_i,
-                strict_biallelic=bool(strict_biallelic),
-                chrom_key=chrom_key,
-                pos=int(reader.variant_pos(vidx)),
-            )
-
-            positions.append(int(reader.variant_pos(vidx)))
-            refs.append(ref_i)
-            alts.append(alt_i)
-            raw_vid = reader.variant_id(vidx).strip()
-            vids.append(raw_vid if raw_vid not in {"", "."} else ".")
-
-        for start in range(0, n_variants, int(variant_block_size)):
-            end = min(n_variants, start + int(variant_block_size))
-            block_n = int(end - start)
-            if block_n <= 0:
-                continue
-
-            allele_block = np.empty((block_n, 2 * n_samples_reader), dtype=np.int32, order="C")
-            phase_block = np.empty((block_n, n_samples_reader), dtype=np.uint8, order="C")
-            reader.read_alleles_and_phasepresent_range(start, end, allele_block, phase_block)
-
-            valid = (allele_block >= 0)
-            if strict_biallelic and np.any(allele_block[valid] > 1):
-                bad = np.argwhere((allele_block >= 0) & (allele_block > 1))[0]
-                rel_vidx = int(bad[0])
-                pos = positions[start + rel_vidx]
-                raise ValueError(
-                    f"non-biallelic allele code encountered while ingesting {chrom_key}:{pos}"
-                )
-
-            a0 = allele_block[:, 0::2]
-            a1 = allele_block[:, 1::2]
-            missing = (a0 < 0) | (a1 < 0)
-            het = (a0 != a1) & (~missing)
-            unphased_het = (phase_block == 0) & het
-
-            if bool(np.any(unphased_het)):
-                unphased_gt_count += int(np.sum(unphased_het))
-                if on_unphased_gt == "error":
-                    first = np.argwhere(unphased_het)[0]
-                    rel_vidx = int(first[0])
-                    sample_i = int(first[1])
-                    pos = positions[start + rel_vidx]
-                    raise ValueError(
-                        "unphased heterozygous genotype encountered while ingesting PGEN "
-                        f"(variant={chrom_key}:{pos}, sample_index={sample_i})"
-                    )
-                a0[unphased_het] = -9
-                a1[unphased_het] = -9
-
-            pair_missing = (a0 < 0) | (a1 < 0)
-            a0[pair_missing] = -9
-            a1[pair_missing] = -9
-
-            haps_block = allele_block.T
-            haps_block = np.where(haps_block < 0, _MISSING_SENTINEL, haps_block).astype(np.uint8, copy=False)
-            if hap_reorder is not None:
-                haps_block = haps_block[hap_reorder, :]
-            blocks.append(np.ascontiguousarray(haps_block))
-
-    haplotypes = np.concatenate(blocks, axis=1)
-
-    attrs_payload = dict(attrs or {})
-    attrs_payload.setdefault("source", "pgen")
-    attrs_payload["unphased_gt_count"] = int(unphased_gt_count)
-
-    return ingest_arrays(
         output_zarr=output_zarr,
-        chrom=chrom_key,
-        haplotypes=haplotypes,
-        variant_pos=np.asarray(positions, dtype=np.int64),
-        sample_ids=selected_sample_ids,
-        ref=refs,
-        alt=alts,
-        vid=vids,
-        store_genotypes=bool(store_genotypes),
+        chrom_key=chrom_key,
+        selected_sample_ids=selected_sample_ids,
+        reader_subset=reader_subset,
+        hap_reorder=hap_reorder,
+        start_variant=0,
+        end_variant=n_variants,
+        variant_block_size=int(variant_block_size),
+        on_unphased_gt=on_unphased_gt,
+        strict_biallelic=bool(strict_biallelic),
         chunk_variant_size=int(chunk_variant_size),
         chunk_haplotype_size=chunk_haplotype_size,
         chunk_sample_size=chunk_sample_size,
         compression_level=int(compression_level),
-        attrs=attrs_payload,
+        store_genotypes=bool(store_genotypes),
+        attrs=attrs,
+        scratch_dir=scratch_dir,
+        cleanup_intermediates=bool(cleanup_intermediates),
     )
 
 
@@ -645,10 +800,6 @@ def _ingest_pgen_variant_range_to_store(
     end_variant: int,
     reader_subset: np.ndarray | None,
     hap_reorder: np.ndarray | None,
-    positions: np.ndarray,
-    ref: np.ndarray,
-    alt: np.ndarray,
-    vid: np.ndarray,
     strict_biallelic: bool,
     on_unphased_gt: UnphasedPolicy,
     variant_block_size: int,
@@ -658,86 +809,27 @@ def _ingest_pgen_variant_range_to_store(
     compression_level: int,
     store_genotypes: bool,
 ) -> tuple[str, int]:
-    start = int(start_variant)
-    end = int(end_variant)
-    if start < 0 or end <= start:
-        raise ValueError(f"invalid shard range [{start}, {end})")
-
-    with PgenlibReader(
+    out = _stream_pgen_range_to_store(
         pgen_path=Path(pgen_path),
         pvar_path=Path(pvar_path),
-        sample_subset=reader_subset,
-    ) as reader:
-        n_samples_reader = int(reader.sample_ct)
-        blocks: list[np.ndarray] = []
-        unphased_gt_count = 0
-
-        for block_start in range(start, end, int(variant_block_size)):
-            block_end = min(end, block_start + int(variant_block_size))
-            block_n = int(block_end - block_start)
-            allele_block = np.empty((block_n, 2 * n_samples_reader), dtype=np.int32, order="C")
-            phase_block = np.empty((block_n, n_samples_reader), dtype=np.uint8, order="C")
-            reader.read_alleles_and_phasepresent_range(block_start, block_end, allele_block, phase_block)
-
-            valid = allele_block >= 0
-            if strict_biallelic and np.any(allele_block[valid] > 1):
-                bad = np.argwhere((allele_block >= 0) & (allele_block > 1))[0]
-                rel_vidx = int(bad[0])
-                pos = int(positions[(block_start - start) + rel_vidx])
-                raise ValueError(
-                    f"non-biallelic allele code encountered while ingesting {chrom_key}:{pos}"
-                )
-
-            a0 = allele_block[:, 0::2]
-            a1 = allele_block[:, 1::2]
-            missing = (a0 < 0) | (a1 < 0)
-            het = (a0 != a1) & (~missing)
-            unphased_het = (phase_block == 0) & het
-
-            if bool(np.any(unphased_het)):
-                unphased_gt_count += int(np.sum(unphased_het))
-                if on_unphased_gt == "error":
-                    first = np.argwhere(unphased_het)[0]
-                    rel_vidx = int(first[0])
-                    sample_i = int(first[1])
-                    pos = int(positions[(block_start - start) + rel_vidx])
-                    raise ValueError(
-                        "unphased heterozygous genotype encountered while ingesting PGEN "
-                        f"(variant={chrom_key}:{pos}, sample_index={sample_i})"
-                    )
-                a0[unphased_het] = -9
-                a1[unphased_het] = -9
-
-            pair_missing = (a0 < 0) | (a1 < 0)
-            a0[pair_missing] = -9
-            a1[pair_missing] = -9
-
-            haps_block = allele_block.T
-            haps_block = np.where(haps_block < 0, _MISSING_SENTINEL, haps_block).astype(np.uint8, copy=False)
-            if hap_reorder is not None:
-                haps_block = haps_block[hap_reorder, :]
-            blocks.append(np.ascontiguousarray(haps_block))
-
-    haplotypes = np.concatenate(blocks, axis=1) if blocks else np.zeros((2 * len(selected_sample_ids), 0), dtype=np.uint8)
-
-    out = ingest_arrays(
         output_zarr=output_zarr,
-        chrom=chrom_key,
-        haplotypes=haplotypes,
-        variant_pos=np.asarray(positions, dtype=np.int64),
-        sample_ids=selected_sample_ids,
-        ref=np.asarray(ref, dtype=np.str_).tolist(),
-        alt=np.asarray(alt, dtype=np.str_).tolist(),
-        vid=np.asarray(vid, dtype=np.str_).tolist(),
-        store_genotypes=bool(store_genotypes),
+        chrom_key=chrom_key,
+        selected_sample_ids=selected_sample_ids,
+        reader_subset=reader_subset,
+        hap_reorder=hap_reorder,
+        start_variant=int(start_variant),
+        end_variant=int(end_variant),
+        variant_block_size=int(variant_block_size),
+        on_unphased_gt=on_unphased_gt,
+        strict_biallelic=bool(strict_biallelic),
         chunk_variant_size=int(chunk_variant_size),
         chunk_haplotype_size=chunk_haplotype_size,
         chunk_sample_size=chunk_sample_size,
         compression_level=int(compression_level),
-        attrs={
-            "source": "pgen",
-            "unphased_gt_count": int(unphased_gt_count),
-        },
+        store_genotypes=bool(store_genotypes),
+        attrs={"source": "pgen"},
+        scratch_dir=Path(output_zarr).parent,
+        cleanup_intermediates=True,
     )
     return str(Path(output_zarr)), int(out.attrs(chrom_key).get("extra", {}).get("unphased_gt_count", 0))
 
@@ -799,8 +891,10 @@ def _ingest_pgen_parallel(
     compression_level: int,
     store_genotypes: bool,
     attrs: dict | None,
+    scratch_dir: str | Path | None,
+    cleanup_intermediates: bool,
 ) -> HapStore:
-    positions, ref, alt, vid = _scan_pgen_metadata(
+    positions, _ref, _alt, _vid = _scan_pgen_metadata(
         pgen_path=pgen_path,
         pvar_path=pvar_path,
         chrom_key=chrom_key,
@@ -827,9 +921,15 @@ def _ingest_pgen_parallel(
             compression_level=int(compression_level),
             store_genotypes=bool(store_genotypes),
             attrs=attrs,
+            scratch_dir=scratch_dir,
+            cleanup_intermediates=bool(cleanup_intermediates),
         )
 
-    scratch_root = Path(tempfile.mkdtemp(prefix=f"{Path(output_zarr).stem}.pgen_ingest_", dir=str(Path(output_zarr).parent)))
+    scratch_parent = Path(output_zarr).parent if scratch_dir is None else Path(scratch_dir)
+    scratch_parent.mkdir(parents=True, exist_ok=True)
+    scratch_root = Path(
+        tempfile.mkdtemp(prefix=f"{Path(output_zarr).stem}.pgen_ingest_", dir=str(scratch_parent))
+    )
     shard_store_paths: list[Path] = []
     attrs_payload = dict(attrs or {})
     attrs_payload.setdefault("source", "pgen")
@@ -855,10 +955,6 @@ def _ingest_pgen_parallel(
                         end_variant=int(end),
                         reader_subset=reader_subset,
                         hap_reorder=hap_reorder,
-                        positions=positions[start:end],
-                        ref=ref[start:end],
-                        alt=alt[start:end],
-                        vid=vid[start:end],
                         strict_biallelic=bool(strict_biallelic),
                         on_unphased_gt=on_unphased_gt,
                         variant_block_size=int(variant_block_size),
@@ -873,8 +969,10 @@ def _ingest_pgen_parallel(
             shard_results = [fut.result() for fut in futures]
 
         attrs_payload["unphased_gt_count"] = int(sum(unphased for _, unphased in shard_results))
+        attrs_payload["parallel_mode"] = "pgen_sharded_streaming"
+        attrs_payload["pgen_variant_block_size"] = int(variant_block_size)
         store = concat_hapstores(
-            input_stores=[Path(path) for path, _ in sorted(shard_results, key=lambda x: str(x[0]))],
+            input_stores=shard_store_paths,
             output_store=output_zarr,
             chrom=chrom_key,
             axis="variants",
@@ -889,7 +987,8 @@ def _ingest_pgen_parallel(
         )
         return store
     finally:
-        shutil.rmtree(scratch_root, ignore_errors=True)
+        if cleanup_intermediates:
+            shutil.rmtree(scratch_root, ignore_errors=True)
 
 
 def _normalize_pgen_prefix(path_like: str | Path) -> Path:
@@ -910,6 +1009,25 @@ def _validate_pgen_triplet_exists(prefix: Path) -> None:
     for path in (pgen_path, pvar_path, psam_path):
         if not path.exists():
             raise FileNotFoundError(f"missing expected PGEN artifact: {path}")
+        if path.stat().st_size <= 0:
+            raise ValueError(f"PGEN artifact is empty: {path}")
+
+
+def _validate_pgen_triplet(prefix: Path) -> None:
+    """Validate PGEN/PVAR/PSAM presence, parseability, and count agreement."""
+    _validate_pgen_triplet_exists(prefix)
+    sample_ids = read_sample_ids(Path(f"{prefix}.psam"))
+    with PgenlibReader(
+        pgen_path=Path(f"{prefix}.pgen"),
+        pvar_path=Path(f"{prefix}.pvar"),
+    ) as reader:
+        if int(reader.variant_ct) <= 0:
+            raise ValueError(f"PGEN has no variants: {prefix}")
+        if int(reader.sample_ct) != len(sample_ids):
+            raise ValueError(
+                "PGEN/PSAM sample count mismatch: "
+                f"pgen={reader.sample_ct}, psam={len(sample_ids)}, prefix={prefix}"
+            )
 
 
 def _remove_pgen_triplet(prefix: Path) -> None:

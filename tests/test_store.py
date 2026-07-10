@@ -43,6 +43,49 @@ def test_duplicate_chromosome_raises(tmp_path, synthetic_arrays):
         store.create_chromosome(chrom="chr1", **synthetic_arrays)
 
 
+def test_create_chromosome_rejects_invalid_contract_before_writing(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "invalid.zarr", mode="w")
+    invalid_haps = np.asarray(synthetic_arrays["haplotypes"], dtype=np.int16)
+    invalid_haps[0, 0] = 2
+
+    with pytest.raises(ValueError, match="only 0, 1"):
+        store.create_chromosome(chrom="1", haplotypes=invalid_haps, **{
+            key: value for key, value in synthetic_arrays.items() if key != "haplotypes"
+        })
+    assert store.has_chromosome("1") is False
+
+    with pytest.raises(ValueError, match="sample_ids must be unique"):
+        store.create_chromosome(
+            chrom="1",
+            **{**synthetic_arrays, "sample_ids": ["s1", "s1"]},
+        )
+    assert store.has_chromosome("1") is False
+
+    with pytest.raises(ValueError, match="non-decreasing"):
+        store.create_chromosome(
+            chrom="1",
+            **{**synthetic_arrays, "variant_pos": np.asarray([100, 300, 200, 400])},
+        )
+    assert store.has_chromosome("1") is False
+
+
+def test_variant_alias_lookup_rejects_ambiguous_positions(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "ambiguous.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **{
+            **synthetic_arrays,
+            "variant_pos": np.asarray([100, 100, 300, 400]),
+            "vid": ["v1", "v2", ".", "."],
+        },
+    )
+
+    with pytest.raises(ValueError, match="ambiguous variant alias"):
+        store.read_dosages("1", variant_ids=["1:100"])
+    with pytest.raises(ValueError, match="missing"):
+        store.read_dosages("1", variant_ids=["."])
+
+
 def test_delete_chromosome(tmp_path, synthetic_arrays):
     store = HapStore(tmp_path / "delete.zarr", mode="w")
     store.create_chromosome(chrom="1", **synthetic_arrays)

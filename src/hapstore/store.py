@@ -99,6 +99,7 @@ class HapStore:
 
         self._root = zarr.open(str(self._path), mode=mode)
         self._variant_index_cache: dict[str, dict[str, int]] = {}
+        self._ambiguous_variant_alias_cache: dict[str, set[str]] = {}
         self._last_read_metrics: dict[str, Any] = {}
         if mode in {"a", "w"}:
             if "format" not in self._root.attrs:
@@ -194,7 +195,26 @@ class HapStore:
                 f"haplotypes row count must be even (2 * n_samples), got {haps.shape[0]}"
             )
 
-        sample_ids_arr = _to_unicode_array(np.asarray(sample_ids, dtype=object))
+        if not np.isin(haps, (0, 1, _MISSING_SENTINEL)).all():
+            first_bad = np.argwhere(~np.isin(haps, (0, 1, _MISSING_SENTINEL)))[0]
+            bad_value = haps[tuple(first_bad)]
+            raise ValueError(
+                "haplotypes must contain only 0, 1, or the missing sentinel "
+                f"{_MISSING_SENTINEL}; found {bad_value!r} at "
+                f"({int(first_bad[0])}, {int(first_bad[1])})"
+            )
+
+        sample_ids_raw = np.asarray(sample_ids, dtype=object)
+        if sample_ids_raw.ndim != 1 or sample_ids_raw.shape[0] == 0:
+            raise ValueError(
+                "sample_ids must be a non-empty 1D array, got "
+                f"shape={sample_ids_raw.shape}"
+            )
+        sample_ids_arr = _to_unicode_array(sample_ids_raw)
+        if any(not str(sample_id).strip() for sample_id in sample_ids_arr.tolist()):
+            raise ValueError("sample_ids must not contain empty values")
+        if len(set(sample_ids_arr.tolist())) != int(sample_ids_arr.shape[0]):
+            raise ValueError("sample_ids must be unique")
         n_samples = int(sample_ids_arr.shape[0])
         if haps.shape[0] != 2 * n_samples:
             raise ValueError(
@@ -202,15 +222,28 @@ class HapStore:
                 f"haplotypes.shape[0]={haps.shape[0]} but 2*len(sample_ids)={2 * n_samples}"
             )
 
-        variant_pos_arr = np.asarray(variant_pos, dtype=np.int64)
-        if variant_pos_arr.ndim != 1:
-            raise ValueError(f"variant_pos must be 1D, got shape={variant_pos_arr.shape}")
+        variant_pos_raw = np.asarray(variant_pos)
+        if variant_pos_raw.ndim != 1:
+            raise ValueError(f"variant_pos must be 1D, got shape={variant_pos_raw.shape}")
+        try:
+            variant_pos_float = np.asarray(variant_pos_raw, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("variant_pos must contain numeric values") from exc
+        if not np.all(np.isfinite(variant_pos_float)) or not np.all(variant_pos_float == np.floor(variant_pos_float)):
+            raise ValueError("variant_pos must contain finite integer coordinates")
+        if np.any(variant_pos_float <= 0):
+            raise ValueError("variant_pos must contain positive coordinates")
+        variant_pos_arr = np.asarray(variant_pos_float, dtype=np.int64)
         n_variants = int(variant_pos_arr.shape[0])
+        if n_variants == 0:
+            raise ValueError("hapstore chromosomes must contain at least one variant")
         if haps.shape[1] != n_variants:
             raise ValueError(
                 "haplotype/variant mismatch: "
                 f"haplotypes.shape[1]={haps.shape[1]} but len(variant_pos)={n_variants}"
             )
+        if n_variants > 1 and np.any(np.diff(variant_pos_arr) < 0):
+            raise ValueError("variant_pos must be non-decreasing")
 
         if chunk_variant_size <= 0:
             raise ValueError(f"chunk_variant_size must be positive, got {chunk_variant_size}")
@@ -228,6 +261,9 @@ class HapStore:
         ref_arr = _normalize_optional_str_array(ref, n_variants, "ref", default=".")
         alt_arr = _normalize_optional_str_array(alt, n_variants, "alt", default=".")
         vid_arr = _normalize_optional_str_array(vid, n_variants, "vid", default=".")
+        real_vids = [str(text).strip() for text in vid_arr.tolist() if str(text).strip() not in {"", "."}]
+        if len(set(real_vids)) != len(real_vids):
+            raise ValueError("non-placeholder variant IDs must be unique within a chromosome")
 
         genetic_arr: np.ndarray | None = None
         if genetic_positions is not None:
@@ -237,10 +273,18 @@ class HapStore:
                     "genetic_positions must be shape (V,), got "
                     f"shape={genetic_arr.shape}, expected ({n_variants},)"
                 )
+            if not np.all(np.isfinite(genetic_arr)):
+                raise ValueError("genetic_positions must contain finite values")
 
         populations_arr: np.ndarray | None = None
         if populations is not None:
-            populations_arr = _to_unicode_array(np.asarray(populations, dtype=object))
+            populations_raw = np.asarray(populations, dtype=object)
+            if populations_raw.ndim != 1:
+                raise ValueError(
+                    "populations must be 1D, got "
+                    f"shape={populations_raw.shape}"
+                )
+            populations_arr = _to_unicode_array(populations_raw)
             if populations_arr.ndim != 1 or populations_arr.shape[0] != n_samples:
                 raise ValueError(
                     "populations must be shape (N,), got "
@@ -263,107 +307,114 @@ class HapStore:
         hap_chunks = (hap_chunk, variant_chunk)
         geno_chunks = (sample_chunk_geno, variant_chunk)
 
-        chrom_group = self._root.create_group(chrom_key)
+        try:
+            chrom_group = self._root.create_group(chrom_key)
 
-        chrom_group.create_dataset(
-            "haplotypes",
-            data=haps_u8,
-            dtype=np.uint8,
-            chunks=hap_chunks,
-            compressor=compressor,
-            overwrite=False,
-        )
-
-        if store_genotypes:
-            genotypes = _haplotypes_to_genotypes(haps_u8)
             chrom_group.create_dataset(
-                "genotypes",
-                data=genotypes,
+                "haplotypes",
+                data=haps_u8,
                 dtype=np.uint8,
-                chunks=geno_chunks,
+                chunks=hap_chunks,
                 compressor=compressor,
                 overwrite=False,
             )
 
-        variant_group = chrom_group.create_group("variants")
-        variant_group.create_dataset(
-            "pos",
-            data=variant_pos_arr,
-            dtype=np.int64,
-            chunks=(variant_chunk,),
-            compressor=compressor,
-            overwrite=False,
-        )
-        _create_utf8_array(
-            variant_group,
-            "ref",
-            ref_arr,
-            chunk_size=variant_chunk,
-            compressor=compressor,
-        )
-        _create_utf8_array(
-            variant_group,
-            "alt",
-            alt_arr,
-            chunk_size=variant_chunk,
-            compressor=compressor,
-        )
-        _create_utf8_array(
-            variant_group,
-            "vid",
-            vid_arr,
-            chunk_size=variant_chunk,
-            compressor=compressor,
-        )
-        if genetic_arr is not None:
+            if store_genotypes:
+                genotypes = _haplotypes_to_genotypes(haps_u8)
+                chrom_group.create_dataset(
+                    "genotypes",
+                    data=genotypes,
+                    dtype=np.uint8,
+                    chunks=geno_chunks,
+                    compressor=compressor,
+                    overwrite=False,
+                )
+
+            variant_group = chrom_group.create_group("variants")
             variant_group.create_dataset(
-                "genetic_pos",
-                data=genetic_arr,
-                dtype=np.float64,
+                "pos",
+                data=variant_pos_arr,
+                dtype=np.int64,
                 chunks=(variant_chunk,),
                 compressor=compressor,
                 overwrite=False,
             )
+            _create_utf8_array(
+                variant_group,
+                "ref",
+                ref_arr,
+                chunk_size=variant_chunk,
+                compressor=compressor,
+            )
+            _create_utf8_array(
+                variant_group,
+                "alt",
+                alt_arr,
+                chunk_size=variant_chunk,
+                compressor=compressor,
+            )
+            _create_utf8_array(
+                variant_group,
+                "vid",
+                vid_arr,
+                chunk_size=variant_chunk,
+                compressor=compressor,
+            )
+            if genetic_arr is not None:
+                variant_group.create_dataset(
+                    "genetic_pos",
+                    data=genetic_arr,
+                    dtype=np.float64,
+                    chunks=(variant_chunk,),
+                    compressor=compressor,
+                    overwrite=False,
+                )
 
-        sample_group = chrom_group.create_group("samples")
-        sample_chunk = int(min(max(1, n_samples), 8192))
-        _create_utf8_array(
-            sample_group,
-            "ids",
-            sample_ids_arr,
-            chunk_size=sample_chunk,
-            compressor=compressor,
-        )
-        if populations_arr is not None:
+            sample_group = chrom_group.create_group("samples")
+            sample_chunk = int(min(max(1, n_samples), 8192))
             _create_utf8_array(
                 sample_group,
-                "population",
-                populations_arr,
+                "ids",
+                sample_ids_arr,
                 chunk_size=sample_chunk,
                 compressor=compressor,
             )
+            if populations_arr is not None:
+                _create_utf8_array(
+                    sample_group,
+                    "population",
+                    populations_arr,
+                    chunk_size=sample_chunk,
+                    compressor=compressor,
+                )
 
-        attrs_payload = dict(attrs or {})
-        source = attrs_payload.pop("source", None)
-        build = attrs_payload.pop("build", None)
-        layout_version = 1 if hap_chunk == n_haplotypes and sample_chunk_geno == n_samples else 2
-        chrom_group.attrs.update(
-            build_chrom_attrs(
-                n_samples=n_samples,
-                n_haplotypes=int(haps_u8.shape[0]),
-                n_variants=n_variants,
-                missing_sentinel=_MISSING_SENTINEL,
-                has_missing=has_missing,
-                compression_level=int(compression_level),
-                chunk_variant_size=int(chunk_variant_size),
-                chunk_haplotype_size=chunk_haplotype_size,
-                chunk_sample_size=chunk_sample_size,
-                layout_version=int(layout_version),
-                source=source,
-                build=build,
-                extra=attrs_payload or None,
+            attrs_payload = dict(attrs or {})
+            source = attrs_payload.pop("source", None)
+            build = attrs_payload.pop("build", None)
+            layout_version = 1 if hap_chunk == n_haplotypes and sample_chunk_geno == n_samples else 2
+            chrom_group.attrs.update(
+                build_chrom_attrs(
+                    n_samples=n_samples,
+                    n_haplotypes=int(haps_u8.shape[0]),
+                    n_variants=n_variants,
+                    missing_sentinel=_MISSING_SENTINEL,
+                    has_missing=has_missing,
+                    compression_level=int(compression_level),
+                    chunk_variant_size=int(chunk_variant_size),
+                    chunk_haplotype_size=chunk_haplotype_size,
+                    chunk_sample_size=chunk_sample_size,
+                    layout_version=int(layout_version),
+                    source=source,
+                    build=build,
+                    extra=attrs_payload or None,
+                )
             )
-        )
+        except Exception:
+            if chrom_key in self._root:
+                del self._root[chrom_key]
+            raise
+        self._variant_index_cache.pop(chrom_key, None)
+        self._ambiguous_variant_alias_cache.pop(chrom_key, None)
 
     def delete_chromosome(self, chrom: str | int) -> None:
         self._require_write_mode()
@@ -371,6 +422,8 @@ class HapStore:
         if chrom_key not in self._root:
             raise KeyError(f"chromosome {chrom_key!r} not found; cannot delete")
         del self._root[chrom_key]
+        self._variant_index_cache.pop(chrom_key, None)
+        self._ambiguous_variant_alias_cache.pop(chrom_key, None)
 
     def haplotypes(
         self,
@@ -996,15 +1049,29 @@ class HapStore:
             variants = chrom_group["variants"]
             chrom_alias = str(chrom_key).removeprefix("chr")
             out: dict[str, int] = {}
+            ambiguous: set[str] = set()
+
+            def add_alias(alias: str, index: int) -> None:
+                if alias in ambiguous:
+                    return
+                previous = out.get(alias)
+                if previous is None or previous == int(index):
+                    out[alias] = int(index)
+                    return
+                del out[alias]
+                ambiguous.add(alias)
+
             vid_arr = _to_unicode_array(np.asarray(variants["vid"][:], dtype=object))
             pos_arr = np.asarray(variants["pos"][:], dtype=np.int64)
             for i, vid in enumerate(vid_arr):
-                if vid:
-                    out.setdefault(str(vid), int(i))
+                text = str(vid).strip()
+                if text not in {"", "."}:
+                    add_alias(text, int(i))
             for i, pos in enumerate(pos_arr):
-                out.setdefault(f"chr{chrom_alias}:{int(pos)}", int(i))
-                out.setdefault(f"{chrom_alias}:{int(pos)}", int(i))
+                add_alias(f"chr{chrom_alias}:{int(pos)}", int(i))
+                add_alias(f"{chrom_alias}:{int(pos)}", int(i))
             self._variant_index_cache[chrom_key] = out
+            self._ambiguous_variant_alias_cache[chrom_key] = ambiguous
         return self._variant_index_cache[chrom_key]
 
     def _resolve_variant_indices(
@@ -1018,13 +1085,22 @@ class HapStore:
             raise ValueError("pass exactly one of variant_ids or variant_indices")
         if variant_ids is not None:
             lookup = self._variant_index_map(chrom)
-            missing = [str(variant_id) for variant_id in variant_ids if str(variant_id) not in lookup]
+            chrom_key = self._chrom_key(chrom)
+            ambiguous = self._ambiguous_variant_alias_cache.get(chrom_key, set())
+            requested = [str(variant_id) for variant_id in variant_ids]
+            requested_ambiguous = [alias for alias in requested if alias in ambiguous]
+            if requested_ambiguous:
+                raise ValueError(
+                    f"ambiguous variant alias on HapStore chromosome {chrom_key}: "
+                    f"first={requested_ambiguous[0]!r}; use variant_indices instead"
+                )
+            missing = [variant_id for variant_id in requested if variant_id not in lookup]
             if missing:
                 raise ValueError(
                     f"{len(missing)} variant IDs missing from HapStore chromosome {self._chrom_key(chrom)}; "
                     f"first={missing[:5]}"
                 )
-            arr = np.asarray([lookup[str(variant_id)] for variant_id in variant_ids], dtype=np.int64)
+            arr = np.asarray([lookup[variant_id] for variant_id in requested], dtype=np.int64)
         else:
             arr = np.asarray(variant_indices, dtype=np.int64)
         if arr.ndim != 1:

@@ -94,7 +94,7 @@ store = ingest_vcf(
     vcf_path="panel.chr21.vcf.gz",
     output_zarr="panel.chr21.hapstore.zarr",
     chrom="21",
-    backend="cyvcf2",
+    backend="auto",
     workers=4,
 )
 ```
@@ -139,9 +139,12 @@ export_pgen(
 ## Behavioral notes
 
 - `concat_hapstores` is a concat operation, not a key-based merge.
-- Sample-axis concat requires compatible variant axes across inputs.
-- Variant-axis concat requires identical sample IDs and order across inputs.
+- Sample-axis concat performs complete variant-axis validation by default.
+- Variant-axis concat requires identical sample IDs and order across inputs; unsafe parallel layouts fall back to serial copy.
+- HapStore stores phased, biallelic hardcalls only. VCF ingest rejects multiallelic records and unphased heterozygotes by default; use `on_multiallelic="skip"` or `on_unphased_gt="missing"` only when that loss of information is intended.
+- `backend="auto"` prefers the PLINK2 bridge when available and otherwise uses the required `pysam` reader. `cyvcf2` is available through the `vcf-fast` extra and must be selected explicitly.
 - Parallel staged VCF ingest requires indexed input (`.tbi` or `.csi`).
+- PGEN ingest streams bounded variant blocks. Use `scratch_dir` to place parallel shard intermediates on fast local storage.
 - `export_vcf(..., plink2_location=...)` uses the `HapStore -> PGEN -> VCF` bridge.
 
 ## Reader performance notes

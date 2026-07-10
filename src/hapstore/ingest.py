@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 import uuid
@@ -49,6 +48,7 @@ from ._internal.ingest_finalize import (
 )
 from ._internal.ingest_models import (
     Backend,
+    MultiallelicPolicy,
     MissingRefAltPolicy,
     MissingVidPolicy,
     UnphasedPolicy,
@@ -67,6 +67,97 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PARTITION_BP = 1_000_000
 _AUTO_PARTITION_ROUND_BP = 100_000
+
+
+def _remove_output_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _create_store_transactional(
+    *,
+    output_zarr: str | Path,
+    chrom: str | int,
+    ingested: _IngestArrays,
+    genetic_positions: np.ndarray | None,
+    store_genotypes: bool,
+    chunk_variant_size: int,
+    chunk_haplotype_size: int | None,
+    chunk_sample_size: int | None,
+    compression_level: int,
+    attrs: dict | None,
+) -> HapStore:
+    """Create one chromosome and remove a newly-created root if it fails."""
+    output_path = Path(output_zarr)
+    existed_before = output_path.exists()
+    try:
+        return _create_store_from_ingested(
+            output_zarr=output_path,
+            chrom=chrom,
+            ingested=ingested,
+            genetic_positions=genetic_positions,
+            store_genotypes=store_genotypes,
+            chunk_variant_size=chunk_variant_size,
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=compression_level,
+            attrs=attrs,
+        )
+    except Exception:
+        if not existed_before and output_path.exists():
+            _remove_output_path(output_path)
+        raise
+
+
+def _preflight_vcf_records(
+    *,
+    vcf_path: Path,
+    chrom: str | int,
+    on_multiallelic: MultiallelicPolicy,
+) -> dict[str, int | str]:
+    """Resolve one VCF contig and enforce the biallelic record policy once."""
+    import pysam
+
+    candidates = list(candidate_contigs(chrom))
+    counts = {contig: {"seen": 0, "biallelic": 0, "multiallelic": 0} for contig in candidates}
+    with pysam.VariantFile(str(vcf_path), "r") as vcf:
+        for record in vcf:
+            contig = str(record.contig)
+            if contig not in counts:
+                continue
+            entry = counts[contig]
+            entry["seen"] += 1
+            if record.alts is not None and len(record.alts) > 1:
+                entry["multiallelic"] += 1
+            else:
+                entry["biallelic"] += 1
+
+    resolved = next((contig for contig in candidates if counts[contig]["seen"] > 0), None)
+    if resolved is None:
+        raise ValueError(
+            f"no records found for requested chromosome {normalize_chrom(chrom, prefix=True)!r} "
+            f"in {vcf_path}"
+        )
+    result = counts[resolved]
+    if result["multiallelic"] and on_multiallelic == "error":
+        raise ValueError(
+            "multiallelic record encountered while ingesting "
+            f"{resolved}; set on_multiallelic='skip' to skip such records "
+            f"({result['multiallelic']} encountered)"
+        )
+    if result["biallelic"] == 0:
+        raise ValueError(
+            f"no biallelic variants remain for {resolved}; "
+            f"seen={result['seen']}, multiallelic_skipped={result['multiallelic']}"
+        )
+    return {
+        "ingest_resolved_contig": str(resolved),
+        "records_seen": int(result["seen"]),
+        "records_kept": int(result["biallelic"]),
+        "multiallelic_skipped_count": int(result["multiallelic"]),
+    }
 
 
 def _allocated_cpu_count() -> int | None:
@@ -192,6 +283,7 @@ def _run_plink2_vcf_to_pgen(
     chrom: str | int,
     out_prefix: Path,
     workers: int,
+    skip_multiallelic: bool,
 ) -> tuple[Path, str]:
     plink2_bin = resolve_plink2_binary("plink2")
     failures: list[str] = []
@@ -205,14 +297,14 @@ def _run_plink2_vcf_to_pgen(
             "--allow-extra-chr",
             "--chr",
             str(contig),
-            "--max-alleles",
-            "2",
             "--make-pgen",
             "--out",
             str(out_prefix),
             "--threads",
             str(int(max(1, workers))),
         ]
+        if skip_multiallelic:
+            cmd[6:6] = ["--max-alleles", "2"]
         try:
             run_cmd(cmd)
         except CommandExecutionError as exc:
@@ -247,6 +339,7 @@ def _ingest_vcf_via_plink2_bridge(
     on_missing_ref_alt: MissingRefAltPolicy,
     on_missing_vid: MissingVidPolicy,
     on_unphased_gt: UnphasedPolicy,
+    on_multiallelic: MultiallelicPolicy,
     workers: int,
 ) -> HapStore:
     if not _bridge_backend_supported(
@@ -270,6 +363,7 @@ def _ingest_vcf_via_plink2_bridge(
             chrom=chrom,
             out_prefix=bridge_prefix,
             workers=int(workers),
+            skip_multiallelic=on_multiallelic == "skip",
         )
         from . import pgen as pgen_mod
 
@@ -336,7 +430,7 @@ def _single_shard_store_from_extract(
         partition_seconds=partition_seconds,
         total_seconds=float(time.perf_counter() - total_start),
     )
-    return _create_store_from_ingested(
+    return _create_store_transactional(
         output_zarr=output_zarr,
         chrom=chrom,
         ingested=ingested,
@@ -373,6 +467,8 @@ def _run_staged_backend(
     progress_label: str,
 ) -> HapStore:
     total_start = time.perf_counter()
+    output_path = Path(output_zarr)
+    output_existed_before = output_path.exists()
     map_df = _load_genetic_map_df(genetic_map_path, chrom=chrom)
     scratch_run_dir = _create_staged_scratch_dir(
         base_dir=scratch_dir,
@@ -482,6 +578,8 @@ def _run_staged_backend(
             return store
         except Exception:
             _abort_streaming_finalize(ctx)
+            if not output_existed_before and output_path.exists():
+                _remove_output_path(output_path)
             raise
     finally:
         if cleanup_intermediates:
@@ -505,7 +603,8 @@ def ingest_vcf(
     attrs: dict | None = None,
     on_missing_ref_alt: MissingRefAltPolicy = "error",
     on_missing_vid: MissingVidPolicy = "dot",
-    on_unphased_gt: UnphasedPolicy = "missing",
+    on_unphased_gt: UnphasedPolicy = "error",
+    on_multiallelic: MultiallelicPolicy = "error",
     workers: int = 1,
     partition_bp: int | None = None,
     scratch_dir: str | Path | None = None,
@@ -526,6 +625,10 @@ def ingest_vcf(
         raise ValueError(f"on_missing_vid must be 'dot' or 'error', got {on_missing_vid!r}")
     if on_unphased_gt not in {"missing", "error"}:
         raise ValueError(f"on_unphased_gt must be 'missing' or 'error', got {on_unphased_gt!r}")
+    if on_multiallelic not in {"error", "skip"}:
+        raise ValueError(
+            f"on_multiallelic must be 'error' or 'skip', got {on_multiallelic!r}"
+        )
     if int(workers) < 1:
         raise ValueError(f"workers must be >=1, got {workers}")
     if partition_bp is not None and int(partition_bp) <= 0:
@@ -537,6 +640,21 @@ def ingest_vcf(
     if chunk_sample_size is not None and int(chunk_sample_size) <= 0:
         raise ValueError(f"chunk_sample_size must be >0 when provided, got {chunk_sample_size}")
 
+    requested_backend = backend
+    attrs_payload = dict(attrs or {})
+    attrs_payload.update(
+        _preflight_vcf_records(
+            vcf_path=vcf,
+            chrom=chrom,
+            on_multiallelic=on_multiallelic,
+        )
+    )
+    attrs_payload["ingest_backend_requested"] = str(requested_backend)
+    attrs_payload["on_missing_ref_alt"] = str(on_missing_ref_alt)
+    attrs_payload["on_missing_vid"] = str(on_missing_vid)
+    attrs_payload["on_unphased_gt"] = str(on_unphased_gt)
+    attrs_payload["on_multiallelic"] = str(on_multiallelic)
+
     if int(workers) > 1:
         _warn_reader_worker_budget(int(workers), backend)
 
@@ -546,6 +664,11 @@ def ingest_vcf(
             on_missing_vid=on_missing_vid,
         ):
             try:
+                resolve_plink2_binary("plink2")
+            except FileNotFoundError as exc:
+                attrs_payload["auto_fallback_reason"] = str(exc)
+            else:
+                attrs_payload["ingest_backend"] = "plink2_bridge"
                 return _ingest_vcf_via_plink2_bridge(
                     vcf_path=vcf,
                     output_zarr=output_zarr,
@@ -557,17 +680,20 @@ def ingest_vcf(
                     chunk_sample_size=chunk_sample_size,
                     compression_level=compression_level,
                     store_genotypes=store_genotypes,
-                    attrs=attrs,
+                    attrs=attrs_payload,
                     on_missing_ref_alt=on_missing_ref_alt,
                     on_missing_vid=on_missing_vid,
                     on_unphased_gt=on_unphased_gt,
+                    on_multiallelic=on_multiallelic,
                     workers=int(workers),
                 )
-            except (FileNotFoundError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
-                logger.info("plink2 bridge unavailable for %s; falling back to cyvcf2 (%s)", vcf, exc)
-        backend = "cyvcf2"
+        else:
+            attrs_payload["auto_fallback_reason"] = "requested metadata policy is unsupported by plink2_bridge"
+        backend = "pysam"
+        attrs_payload["ingest_backend"] = "pysam"
 
     if backend == "plink2_bridge":
+        attrs_payload["ingest_backend"] = "plink2_bridge"
         return _ingest_vcf_via_plink2_bridge(
             vcf_path=vcf,
             output_zarr=output_zarr,
@@ -579,12 +705,15 @@ def ingest_vcf(
             chunk_sample_size=chunk_sample_size,
             compression_level=compression_level,
             store_genotypes=store_genotypes,
-            attrs=attrs,
+            attrs=attrs_payload,
             on_missing_ref_alt=on_missing_ref_alt,
             on_missing_vid=on_missing_vid,
             on_unphased_gt=on_unphased_gt,
+            on_multiallelic=on_multiallelic,
             workers=int(workers),
         )
+
+    attrs_payload["ingest_backend"] = str(backend)
 
     if backend == "pysam" and int(workers) > 1:
         return _ingest_vcf_pysam_staged(
@@ -598,7 +727,7 @@ def ingest_vcf(
             chunk_sample_size=chunk_sample_size,
             compression_level=compression_level,
             store_genotypes=store_genotypes,
-            attrs=attrs,
+            attrs=attrs_payload,
             on_missing_ref_alt=on_missing_ref_alt,
             on_missing_vid=on_missing_vid,
             on_unphased_gt=on_unphased_gt,
@@ -619,7 +748,7 @@ def ingest_vcf(
             chunk_sample_size=chunk_sample_size,
             compression_level=compression_level,
             store_genotypes=store_genotypes,
-            attrs=attrs,
+            attrs=attrs_payload,
             on_missing_ref_alt=on_missing_ref_alt,
             on_missing_vid=on_missing_vid,
             on_unphased_gt=on_unphased_gt,
@@ -642,7 +771,7 @@ def ingest_vcf(
     map_df = _load_genetic_map_df(genetic_map_path, chrom=chrom)
     genetic_positions = _interpolate_genetic_positions(ingested.positions, map_df=map_df, chrom=chrom)
     attrs_payload = _build_ingest_attrs_payload(
-        attrs=attrs,
+        attrs=attrs_payload,
         ingested=ingested,
         parallel_workers=1,
         parallel_shards=1,
@@ -656,7 +785,7 @@ def ingest_vcf(
     attrs_payload.pop("partition_bp", None)
     attrs_payload.pop("total_seconds", None)
 
-    return _create_store_from_ingested(
+    return _create_store_transactional(
         output_zarr=output_zarr,
         chrom=chrom,
         ingested=ingested,
@@ -689,25 +818,32 @@ def ingest_arrays(
     attrs: dict | None = None,
 ) -> HapStore:
     """Ingest in-memory arrays into a hapstore."""
-    store = HapStore(output_zarr, mode="a")
-    store.create_chromosome(
-        chrom=normalize_chrom(chrom, prefix=True),
-        haplotypes=haplotypes,
-        variant_pos=variant_pos,
-        sample_ids=sample_ids,
-        ref=ref,
-        alt=alt,
-        vid=vid,
-        genetic_positions=genetic_positions,
-        populations=populations,
-        store_genotypes=store_genotypes,
-        chunk_variant_size=chunk_variant_size,
-        chunk_haplotype_size=chunk_haplotype_size,
-        chunk_sample_size=chunk_sample_size,
-        compression_level=compression_level,
-        attrs=attrs,
-    )
-    return store
+    output_path = Path(output_zarr)
+    existed_before = output_path.exists()
+    try:
+        store = HapStore(output_path, mode="a")
+        store.create_chromosome(
+            chrom=normalize_chrom(chrom, prefix=True),
+            haplotypes=haplotypes,
+            variant_pos=variant_pos,
+            sample_ids=sample_ids,
+            ref=ref,
+            alt=alt,
+            vid=vid,
+            genetic_positions=genetic_positions,
+            populations=populations,
+            store_genotypes=store_genotypes,
+            chunk_variant_size=chunk_variant_size,
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+            compression_level=compression_level,
+            attrs=attrs,
+        )
+        return store
+    except Exception:
+        if not existed_before and output_path.exists():
+            _remove_output_path(output_path)
+        raise
 
 
 def _ingest_vcf_pysam_staged(
@@ -1144,7 +1280,7 @@ def _read_cyvcf2_shard_worker(
     unphased_gt_count = 0
 
     for variant in iterator:
-        if variant.ALT is None or len(variant.ALT) != 1:
+        if variant.ALT is not None and len(variant.ALT) > 1:
             continue
 
         pos = int(variant.POS)
@@ -1153,7 +1289,7 @@ def _read_cyvcf2_shard_worker(
             chrom=chrom_name,
             pos=pos,
             ref=variant.REF,
-            alt=variant.ALT[0],
+            alt="." if variant.ALT is None else variant.ALT[0],
             on_missing_ref_alt=on_missing_ref_alt,
         )
         vid_i, mvid = _coerce_vid(chrom_name, pos, variant.ID, on_missing_vid)
@@ -1183,14 +1319,18 @@ def _read_cyvcf2_shard_worker(
         a0 = gt[:, 0]
         a1 = gt[:, 1]
         phased = np.ones(n_samples, dtype=bool) if gt.shape[1] < 3 else (gt[:, 2] != 0)
-        not_phased = ~phased
-        if bool(np.any(not_phased)):
-            unphased_gt_count += int(np.sum(not_phased))
+        called = (a0 >= 0) & (a1 >= 0)
+        unphased_het = (~phased) & called & (a0 != a1)
+        if bool(np.any(unphased_het)):
+            unphased_gt_count += int(np.sum(unphased_het))
             if on_unphased_gt == "error":
-                bad = int(np.flatnonzero(not_phased)[0])
-                raise ValueError(f"unphased genotype at {chrom_name}:{pos} sample={subset_samples[bad]}")
+                bad = int(np.flatnonzero(unphased_het)[0])
+                raise ValueError(
+                    "unphased genotype is heterozygous at "
+                    f"{chrom_name}:{pos} sample={subset_samples[bad]}"
+                )
 
-        missing = (a0 < 0) | (a1 < 0) | not_phased
+        missing = (a0 < 0) | (a1 < 0) | unphased_het
         col[0::2] = np.where(missing, _MISSING_SENTINEL, (a0 > 0).astype(np.uint8))
         col[1::2] = np.where(missing, _MISSING_SENTINEL, (a1 > 0).astype(np.uint8))
         positions.append(pos)
@@ -1305,7 +1445,7 @@ def _read_pysam_shard_worker(
     unphased_gt_count = 0
 
     for record in iterator:
-        if record.alts is None or len(record.alts) != 1:
+        if record.alts is not None and len(record.alts) > 1:
             continue
 
         pos = int(record.pos)
@@ -1314,7 +1454,7 @@ def _read_pysam_shard_worker(
             chrom=chrom_name,
             pos=pos,
             ref=record.ref,
-            alt=record.alts[0],
+            alt="." if record.alts is None else record.alts[0],
             on_missing_ref_alt=on_missing_ref_alt,
         )
         vid_i, mvid = _coerce_vid(chrom_name, pos, record.id, on_missing_vid)
@@ -1331,16 +1471,19 @@ def _read_pysam_shard_worker(
                 hap[2 * out_i + 1] = _MISSING_SENTINEL
                 continue
 
-            if not phased:
-                unphased_gt_count += 1
-                if on_unphased_gt == "error":
-                    raise ValueError(f"unphased genotype at {chrom_name}:{pos} sample={sample_name}")
+            a0, a1 = gt[0], gt[1]
+            if a0 is None or a1 is None or int(a0) < 0 or int(a1) < 0:
                 hap[2 * out_i] = _MISSING_SENTINEL
                 hap[2 * out_i + 1] = _MISSING_SENTINEL
                 continue
 
-            a0, a1 = gt[0], gt[1]
-            if a0 is None or a1 is None or int(a0) < 0 or int(a1) < 0:
+            if not phased and int(a0) != int(a1):
+                unphased_gt_count += 1
+                if on_unphased_gt == "error":
+                    raise ValueError(
+                        "unphased genotype is heterozygous at "
+                        f"{chrom_name}:{pos} sample={sample_name}"
+                    )
                 hap[2 * out_i] = _MISSING_SENTINEL
                 hap[2 * out_i + 1] = _MISSING_SENTINEL
                 continue

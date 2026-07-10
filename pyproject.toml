@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hapstore"
-version = "0.1.0"
+version = "0.4.0"
 description = "Zarr-backed phased haplotype store with VCF/PGEN I/O"
 requires-python = ">=3.10"
 license = "MIT"
@@ -17,8 +17,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pgen = ["pgenlib>=0.91"]
+pgen = ["pgenlib>=0.93"]
+vcf-fast = ["cyvcf2>=0.30"]
 dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/sriraj-lab/hapstore"
+Repository = "https://github.com/sriraj-lab/hapstore"
+Issues = "https://github.com/sriraj-lab/hapstore/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

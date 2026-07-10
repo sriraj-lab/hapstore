@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shutil
+from pathlib import Path
 
 from hapstore import HapStore, export_pgen, ingest_arrays, ingest_pgen
 
@@ -154,6 +155,10 @@ def test_export_pgen_rejects_multiallelic_alt_metadata(tmp_path):
             chrom="1",
             strict_biallelic=True,
         )
+    prefix = tmp_path / "bad" / "chr1"
+    assert not Path(f"{prefix}.pgen").exists()
+    assert not Path(f"{prefix}.pvar").exists()
+    assert not Path(f"{prefix}.psam").exists()
 
 
 def test_export_pgen_partial_missing_policy(tmp_path):
