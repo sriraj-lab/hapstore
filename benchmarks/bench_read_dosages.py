@@ -32,6 +32,7 @@ if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from hapstore import HapStore, HapStoreDosageRequest  # noqa: E402
+from hapstore._internal.chunking import DEFAULT_VARIANT_CHUNK_SIZE  # noqa: E402
 from hapstore.chrom import normalize_chrom  # noqa: E402
 
 READ_ENV_KEYS = (
@@ -298,7 +299,11 @@ def _compute_maf_scan(
     if n_variants <= 0:
         return np.empty(0, dtype=np.float64)
     attrs = store.attrs(chrom)
-    width = int(block_size or attrs.get("chunk_variant_size", 500) or 500)
+    width = int(
+        block_size
+        or attrs.get("chunk_variant_size", DEFAULT_VARIANT_CHUNK_SIZE)
+        or DEFAULT_VARIANT_CHUNK_SIZE
+    )
     width = min(max(1, width), n_variants)
     sample_mask = None
     if sample_indices is not None:
@@ -336,7 +341,13 @@ def _run_case(
             "dataset": "genotypes" if "genotypes" in store.root[normalize_chrom(chrom, prefix=True)] else "haplotypes",
             "n_samples": int(store.n_samples(chrom)),
             "n_variants": int(result.shape[0]),
-            "maf_block_size": int(case.maf_block_size or store.attrs(chrom).get("chunk_variant_size", 500) or 500),
+            "maf_block_size": int(
+                case.maf_block_size
+                or store.attrs(chrom).get(
+                    "chunk_variant_size", DEFAULT_VARIANT_CHUNK_SIZE
+                )
+                or DEFAULT_VARIANT_CHUNK_SIZE
+            ),
         }
         return result, metrics
 

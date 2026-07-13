@@ -4,6 +4,7 @@ import csv
 import json
 
 import numpy as np
+from benchmarks.bench_chunk_layout import _parse_layout
 from benchmarks.bench_chunk_layout import main as chunk_layout_main
 from benchmarks.bench_pgen_export import main as pgen_export_main
 from benchmarks.bench_read_dosages import main
@@ -163,6 +164,11 @@ def test_bench_chunk_layout_cli_writes_and_compares_layouts(tmp_path):
     assert metadata["status"] == "complete"
     assert metadata["source_shape"] == [16, 24]
     assert metadata["completed_layouts"] == ["full", "bounded"]
+
+
+def test_bench_chunk_layout_distinguishes_full_and_auto_chunks():
+    assert _parse_layout("legacy:500:full").haplotype_chunk == "full"
+    assert _parse_layout("default:500:auto").haplotype_chunk == "auto"
 
 
 def test_bench_pgen_export_cli_runs_component_timings(tmp_path, capsys):

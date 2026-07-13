@@ -10,6 +10,7 @@ import numpy as np
 from numcodecs import VLenUTF8, Zstd
 
 from hapstore._internal.chrom_attrs import build_chrom_attrs
+from hapstore._internal.chunking import resolve_matrix_chunk_layout
 from hapstore._internal.genetic_map import interpolate_cm
 from hapstore._internal.ingest_models import (
     _IngestArrays,
@@ -130,13 +131,22 @@ def _create_streaming_finalize_context(
             )
         prev_start_bp = current_start
 
-    variant_chunk = int(max(1, int(chunk_variant_size)))
-    hap_chunk = int(n_haplotypes if chunk_haplotype_size is None else chunk_haplotype_size)
-    hap_chunk = int(min(max(1, hap_chunk), n_haplotypes))
-    sample_chunk_geno = int(n_samples if chunk_sample_size is None else chunk_sample_size)
-    sample_chunk_geno = int(min(max(1, sample_chunk_geno), n_samples))
+    initial_capacity = _estimate_initial_variant_capacity(
+        shard_specs=shard_specs,
+        variant_chunk=int(chunk_variant_size),
+    )
+    chunk_layout = resolve_matrix_chunk_layout(
+        n_haplotypes=n_haplotypes,
+        n_samples=n_samples,
+        n_variants=initial_capacity,
+        chunk_variant_size=int(chunk_variant_size),
+        chunk_haplotype_size=chunk_haplotype_size,
+        chunk_sample_size=chunk_sample_size,
+    )
+    variant_chunk = int(chunk_layout.variant)
+    hap_chunk = int(chunk_layout.haplotype)
+    sample_chunk_geno = int(chunk_layout.sample)
     compressor = Zstd(level=int(compression_level))
-    initial_capacity = _estimate_initial_variant_capacity(shard_specs=shard_specs, variant_chunk=variant_chunk)
 
     store = HapStore(output_zarr, mode="a")
     if store.has_chromosome(chrom_key):
@@ -213,8 +223,8 @@ def _create_streaming_finalize_context(
         hap_chunk=hap_chunk,
         sample_chunk_geno=sample_chunk_geno,
         compression_level=int(compression_level),
-        chunk_haplotype_size=chunk_haplotype_size,
-        chunk_sample_size=chunk_sample_size,
+        chunk_haplotype_size=int(hap_chunk),
+        chunk_sample_size=(int(sample_chunk_geno) if store_genotypes else None),
         capacity=initial_capacity,
     )
 
@@ -386,7 +396,10 @@ def _complete_streaming_finalize(
 
     source = payload.pop("source", None)
     build = payload.pop("build", None)
-    layout_version = 1 if ctx.hap_chunk == ctx.n_haplotypes and ctx.sample_chunk_geno == ctx.n_samples else 2
+    full_matrix_chunks = ctx.hap_chunk == ctx.n_haplotypes and (
+        ctx.geno_arr is None or ctx.sample_chunk_geno == ctx.n_samples
+    )
+    layout_version = 1 if full_matrix_chunks else 2
     ctx.chrom_group.attrs.update(
         build_chrom_attrs(
             n_samples=int(ctx.n_samples),
@@ -397,7 +410,9 @@ def _complete_streaming_finalize(
             compression_level=int(ctx.compression_level),
             chunk_variant_size=int(ctx.variant_chunk),
             chunk_haplotype_size=ctx.chunk_haplotype_size,
-            chunk_sample_size=ctx.chunk_sample_size,
+            chunk_sample_size=(
+                int(ctx.sample_chunk_geno) if ctx.geno_arr is not None else None
+            ),
             layout_version=int(layout_version),
             source=source,
             build=build,

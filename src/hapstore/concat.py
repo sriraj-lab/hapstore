@@ -18,6 +18,10 @@ from hapstore.chrom import normalize_chrom
 from hapstore.seeding import stable_seed
 
 from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.chunking import (
+    DEFAULT_VARIANT_CHUNK_SIZE,
+    resolve_matrix_chunk_layout,
+)
 from ._internal.concat_copy import (
     _build_sample_axis_plans,
     _build_variant_axis_plans,
@@ -444,9 +448,9 @@ def _resolve_layout(
 ) -> _ResolvedLayout:
     attrs0 = sources[0].store.attrs(chrom_key)
     default_level = int(attrs0.get("compression_level", 3))
-    default_variant_chunk = int(attrs0.get("chunk_variant_size", 500))
-    default_hap_chunk = attrs0.get("chunk_haplotype_size", None)
-    default_sample_chunk = attrs0.get("chunk_sample_size", None)
+    default_variant_chunk = int(
+        attrs0.get("chunk_variant_size", DEFAULT_VARIANT_CHUNK_SIZE)
+    )
 
     if compression_level is None:
         levels = [int(src.store.attrs(chrom_key).get("compression_level", 3)) for src in sources]
@@ -457,27 +461,18 @@ def _resolve_layout(
             )
 
     if chunk_variant_size is None:
-        chunks = [int(src.store.attrs(chrom_key).get("chunk_variant_size", 500)) for src in sources]
+        chunks = [
+            int(
+                src.store.attrs(chrom_key).get(
+                    "chunk_variant_size", DEFAULT_VARIANT_CHUNK_SIZE
+                )
+            )
+            for src in sources
+        ]
         if any(x != chunks[0] for x in chunks[1:]):
             raise ValueError(
                 "inconsistent source chunk_variant_size; pass chunk_variant_size explicitly "
                 f"(values={sorted(set(chunks))})"
-            )
-
-    if chunk_haplotype_size is None:
-        hap_chunks = [src.store.attrs(chrom_key).get("chunk_haplotype_size", None) for src in sources]
-        if any(x != hap_chunks[0] for x in hap_chunks[1:]):
-            raise ValueError(
-                "inconsistent source chunk_haplotype_size; pass chunk_haplotype_size explicitly "
-                f"(values={sorted(set(hap_chunks), key=lambda x: (-1 if x is None else int(x)))})"
-            )
-
-    if chunk_sample_size is None:
-        sample_chunks = [src.store.attrs(chrom_key).get("chunk_sample_size", None) for src in sources]
-        if any(x != sample_chunks[0] for x in sample_chunks[1:]):
-            raise ValueError(
-                "inconsistent source chunk_sample_size; pass chunk_sample_size explicitly "
-                f"(values={sorted(set(sample_chunks), key=lambda x: (-1 if x is None else int(x)))})"
             )
 
     resolved_level = int(default_level if compression_level is None else compression_level)
@@ -489,14 +484,14 @@ def _resolve_layout(
         raise ValueError(f"chunk_variant_size must be > 0, got {resolved_variant_chunk}")
 
     if chunk_haplotype_size is None:
-        hap_chunk_attr = None if default_hap_chunk is None else int(default_hap_chunk)
+        hap_chunk_attr = None
     else:
         hap_chunk_attr = int(chunk_haplotype_size)
         if hap_chunk_attr <= 0:
             raise ValueError(f"chunk_haplotype_size must be > 0 when provided, got {hap_chunk_attr}")
 
     if chunk_sample_size is None:
-        sample_chunk_attr = None if default_sample_chunk is None else int(default_sample_chunk)
+        sample_chunk_attr = None
     else:
         sample_chunk_attr = int(chunk_sample_size)
         if sample_chunk_attr <= 0:
@@ -565,23 +560,23 @@ def _concat_samples_into_store(
     merged_populations = _merge_populations_or_none(sources)
     has_missing = bool(any(src.has_missing for src in sources))
 
-    variant_chunk = int(min(max(1, resolved.variant_chunk_attr), max(1, n_variants)))
+    chunk_layout = resolve_matrix_chunk_layout(
+        n_haplotypes=total_haps,
+        n_samples=total_samples,
+        n_variants=n_variants,
+        chunk_variant_size=resolved.variant_chunk_attr,
+        chunk_haplotype_size=resolved.chunk_haplotype_size_attr,
+        chunk_sample_size=resolved.chunk_sample_size_attr,
+    )
+    variant_chunk = int(chunk_layout.variant)
     if strict_variant_ids:
         if validate == "full":
             _validate_variant_axis_streaming(sources=sources, variant_chunk=variant_chunk)
         elif validate == "spot":
             _spot_validate_variant_axis(sources=sources, variant_chunk=variant_chunk)
 
-    hap_chunk = (
-        int(total_haps)
-        if resolved.chunk_haplotype_size_attr is None
-        else int(min(max(1, resolved.chunk_haplotype_size_attr), total_haps))
-    )
-    sample_chunk_geno = (
-        int(total_samples)
-        if resolved.chunk_sample_size_attr is None
-        else int(min(max(1, resolved.chunk_sample_size_attr), total_samples))
-    )
+    hap_chunk = int(chunk_layout.haplotype)
+    sample_chunk_geno = int(chunk_layout.sample)
 
     chrom_group = out.root.create_group(chrom_key)
     chrom_group.create_dataset(
@@ -645,7 +640,10 @@ def _concat_samples_into_store(
     attrs_payload = dict(attrs or {})
     source_attr = attrs_payload.pop("source", None)
     build_attr = attrs_payload.pop("build", None)
-    layout_version = 1 if hap_chunk == total_haps and sample_chunk_geno == total_samples else 2
+    full_matrix_chunks = hap_chunk == total_haps and (
+        not store_genotypes or sample_chunk_geno == total_samples
+    )
+    layout_version = 1 if full_matrix_chunks else 2
     chrom_group.attrs.update(
         build_chrom_attrs(
             n_samples=int(total_samples),
@@ -655,8 +653,10 @@ def _concat_samples_into_store(
             has_missing=bool(has_missing),
             compression_level=int(resolved.compression_level),
             chunk_variant_size=int(variant_chunk),
-            chunk_haplotype_size=resolved.chunk_haplotype_size_attr,
-            chunk_sample_size=resolved.chunk_sample_size_attr,
+            chunk_haplotype_size=int(hap_chunk),
+            chunk_sample_size=(
+                int(sample_chunk_geno) if store_genotypes else None
+            ),
             layout_version=int(layout_version),
             source=source_attr,
             build=build_attr,
@@ -725,17 +725,17 @@ def _concat_variants_into_store(
     total_variants = int(sum(src.n_variants for src in sources))
     has_missing = bool(any(src.has_missing for src in sources))
 
-    variant_chunk = int(min(max(1, resolved.variant_chunk_attr), max(1, total_variants)))
-    hap_chunk = (
-        int(n_haps)
-        if resolved.chunk_haplotype_size_attr is None
-        else int(min(max(1, resolved.chunk_haplotype_size_attr), n_haps))
+    chunk_layout = resolve_matrix_chunk_layout(
+        n_haplotypes=n_haps,
+        n_samples=n_samples,
+        n_variants=total_variants,
+        chunk_variant_size=resolved.variant_chunk_attr,
+        chunk_haplotype_size=resolved.chunk_haplotype_size_attr,
+        chunk_sample_size=resolved.chunk_sample_size_attr,
     )
-    sample_chunk_geno = (
-        int(n_samples)
-        if resolved.chunk_sample_size_attr is None
-        else int(min(max(1, resolved.chunk_sample_size_attr), n_samples))
-    )
+    variant_chunk = int(chunk_layout.variant)
+    hap_chunk = int(chunk_layout.haplotype)
+    sample_chunk_geno = int(chunk_layout.sample)
 
     chrom_group = out.root.create_group(chrom_key)
     chrom_group.create_dataset(
@@ -824,7 +824,10 @@ def _concat_variants_into_store(
     attrs_payload = dict(attrs or {})
     source_attr = attrs_payload.pop("source", None)
     build_attr = attrs_payload.pop("build", None)
-    layout_version = 1 if hap_chunk == n_haps and sample_chunk_geno == n_samples else 2
+    full_matrix_chunks = hap_chunk == n_haps and (
+        not store_genotypes or sample_chunk_geno == n_samples
+    )
+    layout_version = 1 if full_matrix_chunks else 2
     chrom_group.attrs.update(
         build_chrom_attrs(
             n_samples=int(n_samples),
@@ -834,8 +837,10 @@ def _concat_variants_into_store(
             has_missing=bool(has_missing),
             compression_level=int(resolved.compression_level),
             chunk_variant_size=int(variant_chunk),
-            chunk_haplotype_size=resolved.chunk_haplotype_size_attr,
-            chunk_sample_size=resolved.chunk_sample_size_attr,
+            chunk_haplotype_size=int(hap_chunk),
+            chunk_sample_size=(
+                int(sample_chunk_geno) if store_genotypes else None
+            ),
             layout_version=int(layout_version),
             source=source_attr,
             build=build_attr,

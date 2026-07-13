@@ -21,6 +21,7 @@ from numcodecs import VLenUTF8, Zstd
 from hapstore.chrom import candidate_contigs, normalize_chrom
 
 from ._internal.command import CommandExecutionError, run_cmd
+from ._internal.chunking import DEFAULT_VARIANT_CHUNK_SIZE
 from ._internal._ingest_index import _has_tabix_index
 from ._internal._ingest_readers import (
     _coerce_ref_alt,
@@ -594,7 +595,7 @@ def ingest_vcf(
     chrom: str | int,
     genetic_map_path: str | Path | None = None,
     sample_ids: list[str] | None = None,
-    chunk_variant_size: int = 500,
+    chunk_variant_size: int = DEFAULT_VARIANT_CHUNK_SIZE,
     chunk_haplotype_size: int | None = None,
     chunk_sample_size: int | None = None,
     compression_level: int = 3,
@@ -811,7 +812,7 @@ def ingest_arrays(
     genetic_positions: np.ndarray | None = None,
     populations: list[str] | np.ndarray | None = None,
     store_genotypes: bool = False,
-    chunk_variant_size: int = 500,
+    chunk_variant_size: int = DEFAULT_VARIANT_CHUNK_SIZE,
     chunk_haplotype_size: int | None = None,
     chunk_sample_size: int | None = None,
     compression_level: int = 3,

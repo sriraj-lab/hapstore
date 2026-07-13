@@ -34,6 +34,9 @@ def test_create_and_read_roundtrip(tmp_path, synthetic_arrays):
     attrs = store.attrs("chr1")
     assert attrs["missing_sentinel"] == 255
     assert attrs["has_missing"] is True
+    assert attrs["chunk_variant_size"] == 4
+    assert attrs["chunk_haplotype_size"] == 4
+    assert attrs["chunk_sample_size"] is None
 
 
 def test_duplicate_chromosome_raises(tmp_path, synthetic_arrays):

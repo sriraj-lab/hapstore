@@ -22,6 +22,7 @@ from hapstore.chrom import normalize_chrom
 from hapstore.ids import read_sample_ids
 
 from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.chunking import DEFAULT_VARIANT_CHUNK_SIZE
 from ._internal.export_selection import (
     _iter_variant_slices,
     _iter_variant_slices_for_indices,
@@ -462,7 +463,12 @@ def _export_pgen_single(
     n_variants = int(pos_ds.shape[0])
 
     # Force block size to a multiple of zarr chunk size for efficient reads
-    chunk_variant_size = int(store.attrs(chrom_key).get("chunk_variant_size", 500) or 500)
+    chunk_variant_size = int(
+        store.attrs(chrom_key).get(
+            "chunk_variant_size", DEFAULT_VARIANT_CHUNK_SIZE
+        )
+        or DEFAULT_VARIANT_CHUNK_SIZE
+    )
     if chunk_variant_size > 0:
         original_block_size = int(variant_block_size)
         if original_block_size < chunk_variant_size:
@@ -584,7 +590,7 @@ def ingest_pgen(
     on_unphased_gt: UnphasedPolicy = "error",
     strict_biallelic: bool = True,
     workers: int = 1,
-    chunk_variant_size: int = 500,
+    chunk_variant_size: int = DEFAULT_VARIANT_CHUNK_SIZE,
     chunk_haplotype_size: int | None = None,
     chunk_sample_size: int | None = None,
     compression_level: int = 3,
@@ -828,6 +834,14 @@ def _restore_parallel_pgen_attrs(
     extra_payload = dict(attrs_payload)
     source = extra_payload.pop("source", None)
     build = extra_payload.pop("build", None)
+    haplotype_chunks = chrom_group["haplotypes"].chunks
+    actual_variant_chunk = int(haplotype_chunks[1])
+    actual_haplotype_chunk = int(haplotype_chunks[0])
+    actual_sample_chunk = (
+        int(chrom_group["genotypes"].chunks[0])
+        if "genotypes" in chrom_group
+        else None
+    )
     chrom_group.attrs.update(
         build_chrom_attrs(
             n_samples=n_samples,
@@ -836,9 +850,9 @@ def _restore_parallel_pgen_attrs(
             missing_sentinel=int(_MISSING_SENTINEL),
             has_missing=has_missing,
             compression_level=int(compression_level),
-            chunk_variant_size=int(chunk_variant_size),
-            chunk_haplotype_size=chunk_haplotype_size,
-            chunk_sample_size=chunk_sample_size,
+            chunk_variant_size=actual_variant_chunk,
+            chunk_haplotype_size=actual_haplotype_chunk,
+            chunk_sample_size=actual_sample_chunk,
             layout_version=int(layout_version),
             source=source,
             build=build,

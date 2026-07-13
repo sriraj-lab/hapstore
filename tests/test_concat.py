@@ -111,6 +111,34 @@ def test_concat_samples_parallel_equals_serial(tmp_path, synthetic_arrays):
     assert a.sample_ids("chr21") == b.sample_ids("chr21")
 
 
+def test_concat_samples_default_layout_accepts_different_source_row_chunks(
+    tmp_path, synthetic_arrays
+):
+    left, right_one = _split_fixture_arrays(synthetic_arrays)
+    right = {
+        **right_one,
+        "haplotypes": np.concatenate(
+            [right_one["haplotypes"], left["haplotypes"]], axis=0
+        ),
+        "sample_ids": np.asarray(["s2", "s3"], dtype=object),
+        "populations": np.asarray(["P2", "P1"], dtype=object),
+    }
+    s1 = ingest_arrays(output_zarr=tmp_path / "left.zarr", chrom="chr21", **left)
+    s2 = ingest_arrays(output_zarr=tmp_path / "right.zarr", chrom="chr21", **right)
+
+    out_path = tmp_path / "concat_default.zarr"
+    concat_hapstores(
+        input_stores=[s1.path, s2.path],
+        output_store=out_path,
+        chrom="chr21",
+        axis="samples",
+    )
+
+    merged = HapStore(out_path, mode="r")
+    assert merged.sample_ids("chr21") == ["s1", "s2", "s3"]
+    assert tuple(merged.root["chr21/haplotypes"].chunks) == (6, 4)
+
+
 def test_concat_samples_direct_chunk_copy_logs_fastpath(tmp_path, synthetic_arrays, caplog):
     left, right = _split_fixture_arrays(synthetic_arrays)
     s1 = ingest_arrays(

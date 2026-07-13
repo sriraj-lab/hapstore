@@ -14,7 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 
@@ -31,12 +31,15 @@ from hapstore.chrom import normalize_chrom  # noqa: E402
 from benchmarks.bench_read_dosages import main as read_benchmark_main  # noqa: E402
 
 
+ChunkSpec = int | Literal["auto", "full"]
+
+
 @dataclass(frozen=True)
 class Layout:
     name: str
     variant_chunk: int
-    haplotype_chunk: int | None
-    sample_chunk: int | None
+    haplotype_chunk: ChunkSpec
+    sample_chunk: ChunkSpec
 
 
 SUMMARY_COLUMNS = (
@@ -62,10 +65,21 @@ def _positive_int(value: str, *, name: str) -> int:
     return parsed
 
 
-def _optional_chunk(value: str, *, name: str) -> int | None:
-    if value.strip().lower() in {"full", "none", "auto"}:
-        return None
+def _optional_chunk(value: str, *, name: str) -> ChunkSpec:
+    normalized = value.strip().lower()
+    if normalized == "full":
+        return "full"
+    if normalized in {"none", "auto"}:
+        return "auto"
     return _positive_int(value, name=name)
+
+
+def _materialize_chunk(spec: ChunkSpec, *, full_size: int) -> int | None:
+    if spec == "auto":
+        return None
+    if spec == "full":
+        return int(full_size)
+    return int(spec)
 
 
 def _parse_layout(value: str) -> Layout:
@@ -83,7 +97,7 @@ def _parse_layout(value: str) -> Layout:
     variant_chunk = _positive_int(parts[1], name="variant chunk")
     haplotype_chunk = _optional_chunk(parts[2], name="haplotype chunk")
     sample_chunk = (
-        _optional_chunk(parts[3], name="sample chunk") if len(parts) == 4 else None
+        _optional_chunk(parts[3], name="sample chunk") if len(parts) == 4 else "auto"
     )
     return Layout(name, variant_chunk, haplotype_chunk, sample_chunk)
 
@@ -152,9 +166,7 @@ def _append_read_rows(
     prefix = {
         "layout": layout.name,
         "layout_variant_chunk": str(layout.variant_chunk),
-        "layout_haplotype_chunk": "full"
-        if layout.haplotype_chunk is None
-        else str(layout.haplotype_chunk),
+        "layout_haplotype_chunk": str(layout.haplotype_chunk),
         "layout_actual_chunks": "x".join(
             str(value) for value in actual_haplotype_chunks
         ),
@@ -375,7 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             shutil.rmtree(candidate_path)
         print(
             f"layout_start name={layout.name} variant_chunk={layout.variant_chunk} "
-            f"haplotype_chunk={layout.haplotype_chunk or 'full'}",
+            f"haplotype_chunk={layout.haplotype_chunk}",
             flush=True,
         )
         write_start = time.perf_counter()
@@ -392,8 +404,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             populations=source["populations"],
             store_genotypes=bool(args.store_genotypes),
             chunk_variant_size=layout.variant_chunk,
-            chunk_haplotype_size=layout.haplotype_chunk,
-            chunk_sample_size=layout.sample_chunk,
+            chunk_haplotype_size=_materialize_chunk(
+                layout.haplotype_chunk,
+                full_size=int(source["haplotypes"].shape[0]),
+            ),
+            chunk_sample_size=_materialize_chunk(
+                layout.sample_chunk,
+                full_size=int(len(source["sample_ids"])),
+            ),
         )
         write_seconds = time.perf_counter() - write_start
         _verify_candidate(
@@ -412,12 +430,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary_row = {
             "layout": layout.name,
             "variant_chunk_requested": layout.variant_chunk,
-            "haplotype_chunk_requested": "full"
-            if layout.haplotype_chunk is None
-            else layout.haplotype_chunk,
-            "sample_chunk_requested": "full"
-            if layout.sample_chunk is None
-            else layout.sample_chunk,
+            "haplotype_chunk_requested": layout.haplotype_chunk,
+            "sample_chunk_requested": layout.sample_chunk,
             "haplotype_chunks_actual": "x".join(str(value) for value in hap_chunks),
             "genotype_chunks_actual": ""
             if genotype_chunks is None

@@ -16,6 +16,10 @@ from numcodecs import VLenUTF8, Zstd
 from hapstore.chrom import normalize_chrom
 
 from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.chunking import (
+    DEFAULT_VARIANT_CHUNK_SIZE,
+    resolve_matrix_chunk_layout,
+)
 from ._internal.export_selection import (
     _iter_variant_slices,
     _iter_variant_slices_for_indices,
@@ -349,8 +353,8 @@ def subset_samples_to_new_store(
     output_store: str | Path,
     *,
     variant_block_size: int = 1000,
-    variant_chunk: int = 500,
-    hap_chunk: int = 2500,
+    variant_chunk: int = DEFAULT_VARIANT_CHUNK_SIZE,
+    hap_chunk: int | None = None,
     compression_level: int = 3,
 ) -> Path:
     """Create a new HapStore containing one chromosome with a subset of samples.
@@ -361,7 +365,7 @@ def subset_samples_to_new_store(
         raise ValueError(f"variant_block_size must be positive, got {variant_block_size}")
     if int(variant_chunk) <= 0:
         raise ValueError(f"variant_chunk must be positive, got {variant_chunk}")
-    if int(hap_chunk) <= 0:
+    if hap_chunk is not None and int(hap_chunk) <= 0:
         raise ValueError(f"hap_chunk must be positive, got {hap_chunk}")
     if int(compression_level) < 0:
         raise ValueError(f"compression_level must be >= 0, got {compression_level}")
@@ -398,8 +402,15 @@ def subset_samples_to_new_store(
     n_haplotypes = 2 * n_samples
 
     compressor = Zstd(level=int(compression_level))
-    variant_chunk = int(min(max(1, int(variant_chunk)), max(1, n_variants)))
-    hap_chunk = int(min(max(1, int(hap_chunk)), n_haplotypes))
+    chunk_layout = resolve_matrix_chunk_layout(
+        n_haplotypes=n_haplotypes,
+        n_samples=n_samples,
+        n_variants=n_variants,
+        chunk_variant_size=int(variant_chunk),
+        chunk_haplotype_size=hap_chunk,
+    )
+    variant_chunk = int(chunk_layout.variant)
+    hap_chunk = int(chunk_layout.haplotype)
     layout_version = 1 if hap_chunk == n_haplotypes else 2
 
     out = HapStore(out_path, mode="w")

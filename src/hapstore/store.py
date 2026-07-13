@@ -17,6 +17,10 @@ from numcodecs import VLenUTF8, Zstd
 from hapstore.chrom import normalize_chrom
 
 from ._internal.chrom_attrs import build_chrom_attrs
+from ._internal.chunking import (
+    DEFAULT_VARIANT_CHUNK_SIZE,
+    resolve_matrix_chunk_layout,
+)
 from ._internal.zarr_utils import _create_utf8_array, _to_unicode_array
 from .windows import compute_window_boundaries, compute_window_midpoints
 
@@ -175,7 +179,7 @@ class HapStore:
         genetic_positions: np.ndarray | None = None,
         populations: list[str] | np.ndarray | None = None,
         store_genotypes: bool = False,
-        chunk_variant_size: int = 500,
+        chunk_variant_size: int = DEFAULT_VARIANT_CHUNK_SIZE,
         chunk_haplotype_size: int | None = None,
         chunk_sample_size: int | None = None,
         compression_level: int = 3,
@@ -300,12 +304,18 @@ class HapStore:
         self._validate_sample_consistency(sample_ids_arr, chrom_key)
 
         compressor = Zstd(level=int(compression_level))
-        variant_chunk = int(min(max(1, int(chunk_variant_size)), max(1, n_variants)))
         n_haplotypes = int(haps_u8.shape[0])
-        hap_chunk = int(n_haplotypes if chunk_haplotype_size is None else chunk_haplotype_size)
-        hap_chunk = int(min(max(1, hap_chunk), n_haplotypes))
-        sample_chunk_geno = int(n_samples if chunk_sample_size is None else chunk_sample_size)
-        sample_chunk_geno = int(min(max(1, sample_chunk_geno), n_samples))
+        chunk_layout = resolve_matrix_chunk_layout(
+            n_haplotypes=n_haplotypes,
+            n_samples=n_samples,
+            n_variants=n_variants,
+            chunk_variant_size=int(chunk_variant_size),
+            chunk_haplotype_size=chunk_haplotype_size,
+            chunk_sample_size=chunk_sample_size,
+        )
+        variant_chunk = int(chunk_layout.variant)
+        hap_chunk = int(chunk_layout.haplotype)
+        sample_chunk_geno = int(chunk_layout.sample)
 
         hap_chunks = (hap_chunk, variant_chunk)
         geno_chunks = (sample_chunk_geno, variant_chunk)
@@ -394,7 +404,10 @@ class HapStore:
             attrs_payload = dict(attrs or {})
             source = attrs_payload.pop("source", None)
             build = attrs_payload.pop("build", None)
-            layout_version = 1 if hap_chunk == n_haplotypes and sample_chunk_geno == n_samples else 2
+            full_matrix_chunks = hap_chunk == n_haplotypes and (
+                not store_genotypes or sample_chunk_geno == n_samples
+            )
+            layout_version = 1 if full_matrix_chunks else 2
             chrom_group.attrs.update(
                 build_chrom_attrs(
                     n_samples=n_samples,
@@ -403,9 +416,11 @@ class HapStore:
                     missing_sentinel=_MISSING_SENTINEL,
                     has_missing=has_missing,
                     compression_level=int(compression_level),
-                    chunk_variant_size=int(chunk_variant_size),
-                    chunk_haplotype_size=chunk_haplotype_size,
-                    chunk_sample_size=chunk_sample_size,
+                    chunk_variant_size=int(variant_chunk),
+                    chunk_haplotype_size=int(hap_chunk),
+                    chunk_sample_size=(
+                        int(sample_chunk_geno) if store_genotypes else None
+                    ),
                     layout_version=int(layout_version),
                     source=source,
                     build=build,
