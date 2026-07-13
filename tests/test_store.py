@@ -335,7 +335,12 @@ def test_read_dosages_auto_default_cap_is_sixteen(monkeypatch):
     monkeypatch.delenv("HAPSTORE_AUTO_READ_WORKERS", raising=False)
     monkeypatch.delenv("HAPSTORE_READ_AUTO_MAX_WORKERS", raising=False)
     monkeypatch.delenv("HAPSTORE_READ_AUTO_MAX", raising=False)
-    monkeypatch.setattr(store_module.os, "cpu_count", lambda: 32)
+    monkeypatch.setattr(store_module, "_available_read_cpu_count", lambda: (32, "test"))
+    monkeypatch.setattr(
+        store_module,
+        "_available_read_memory_bytes",
+        lambda _cpu_count: (64 * 1024**3, "test"),
+    )
 
     workers, policy = store_module._resolve_read_worker_count(
         "auto",
@@ -353,6 +358,76 @@ def test_read_dosages_auto_default_cap_is_sixteen(monkeypatch):
     assert policy["auto_worker_cap"] == 16
     assert policy["auto_worker_cap_source"] == "default"
     assert policy["auto_worker_source"] == "large_tile_grid"
+
+
+def test_auto_read_cpu_count_respects_affinity_and_slurm(monkeypatch):
+    monkeypatch.setattr(store_module.os, "sched_getaffinity", lambda _pid: set(range(12)), raising=False)
+    monkeypatch.setattr(store_module.os, "cpu_count", lambda: 32)
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "4")
+
+    count, source = store_module._available_read_cpu_count()
+
+    assert count == 4
+    assert source == "SLURM_CPUS_PER_TASK"
+
+
+def test_auto_read_workers_are_capped_by_estimated_tile_memory(monkeypatch):
+    monkeypatch.delenv("HAPSTORE_READ_WORKERS", raising=False)
+    monkeypatch.delenv("HAPSTORE_AUTO_READ_WORKERS", raising=False)
+    monkeypatch.setattr(store_module, "_available_read_cpu_count", lambda: (16, "test"))
+    monkeypatch.setattr(
+        store_module,
+        "_available_read_memory_bytes",
+        lambda _cpu_count: (1024 * 1024**2, "test"),
+    )
+
+    workers, policy = store_module._resolve_read_worker_count(
+        "auto",
+        n_tasks=100,
+        n_sample_groups=10,
+        n_variant_groups=10,
+        n_samples=150_000,
+        n_variants=5_000,
+        row_chunk=7_500,
+        variant_chunk=500,
+        dataset="haplotypes",
+        estimated_tile_bytes=200 * 1024**2,
+        output_bytes=100 * 1024**2,
+    )
+
+    assert workers == 2
+    assert policy["auto_memory_worker_cap"] == 2
+    assert policy["auto_memory_budget_mb"] == pytest.approx(412.0)
+
+
+def test_read_dosages_bounds_in_flight_tiles(tmp_path, synthetic_arrays, monkeypatch):
+    store = HapStore(tmp_path / "dosage_bounded_futures.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=1,
+        chunk_haplotype_size=2,
+    )
+    monkeypatch.setenv("HAPSTORE_READ_VARIANT_GROUP_CHUNKS", "1")
+    monkeypatch.setenv("HAPSTORE_READ_SAMPLE_GROUP_CHUNKS", "1")
+
+    got = store.read_dosages(
+        "1",
+        variant_indices=np.asarray([0, 1, 2, 3]),
+        sample_indices=np.asarray([0, 1]),
+        workers=2,
+    )
+    metrics = store.last_read_metrics
+
+    expected = store.read_dosages(
+        "1",
+        variant_indices=np.asarray([0, 1, 2, 3]),
+        sample_indices=np.asarray([0, 1]),
+        workers=1,
+    )
+    np.testing.assert_allclose(got, expected, equal_nan=True)
+    assert metrics["n_tiles"] > metrics["max_in_flight_tiles"]
+    assert metrics["max_in_flight_tiles"] == metrics["workers"] == 2
 
 
 def test_read_dosages_missing_modes(tmp_path, synthetic_arrays):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Hashable, Iterator, Sequence
@@ -22,6 +22,7 @@ from .windows import compute_window_boundaries, compute_window_midpoints
 
 _MISSING_SENTINEL = 255
 _SCHEMA_VERSION = 2
+_AUTO_READ_TILE_MEMORY_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -750,6 +751,18 @@ class HapStore:
             min_density=float(min_density),
         )
         total_tasks = len(variant_groups) * len(sample_groups)
+        row_factor = 1 if arr_name == "genotypes" else 2
+        max_input_rows = max(int(group.stop) - int(group.start) for group in sample_groups) * row_factor
+        max_input_cols = max(int(group.stop) - int(group.start) for group in variant_groups)
+        max_output_rows = max(int(group.out_positions.size) for group in sample_groups)
+        max_output_cols = max(int(group.out_positions.size) for group in variant_groups)
+        input_itemsize = np.dtype(arr.dtype).itemsize
+        estimated_tile_bytes = int(
+            max_input_rows * max_input_cols * input_itemsize
+            + max_output_rows * max_output_cols * row_factor * input_itemsize
+            + max_output_rows * max_output_cols * target_dtype.itemsize
+        )
+        output_bytes = int(sample_idx.size * variant_idx.size * target_dtype.itemsize)
         worker_count, worker_policy = _resolve_read_worker_count(
             workers,
             n_tasks=total_tasks,
@@ -760,6 +773,8 @@ class HapStore:
             row_chunk=row_chunk,
             variant_chunk=variant_chunk,
             dataset=arr_name,
+            estimated_tile_bytes=estimated_tile_bytes,
+            output_bytes=output_bytes,
         )
         out = np.empty((sample_idx.size, variant_idx.size), dtype=target_dtype)
         local = threading.local()
@@ -816,26 +831,39 @@ class HapStore:
             tile_convert_sec = time.perf_counter() - convert_start
             return sample_group.out_positions, variant_group.out_positions, values, tile_read_sec, tile_convert_sec
 
-        if total_tasks <= 1:
-            tasks = [
-                read_tile(sample_groups[0], variant_groups[0])
-            ]
-        else:
-            tasks = []
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hapstore-read") as pool:
-                futures = [
-                    pool.submit(read_tile, sample_group, variant_group)
-                    for sample_group in sample_groups
-                    for variant_group in variant_groups
-                ]
-                for future in as_completed(futures):
-                    tasks.append(future.result())
-        for out_rows, out_cols, values, tile_read_sec, tile_convert_sec in tasks:
+        def assign_tile(tile: tuple[np.ndarray, np.ndarray, np.ndarray, float, float]) -> None:
+            nonlocal read_sec, convert_sec, assign_sec
+            out_rows, out_cols, values, tile_read_sec, tile_convert_sec = tile
             read_sec += float(tile_read_sec)
             convert_sec += float(tile_convert_sec)
             assign_start = time.perf_counter()
             out[np.ix_(out_rows, out_cols)] = values
             assign_sec += time.perf_counter() - assign_start
+
+        max_in_flight_tiles = 1
+        if total_tasks <= 1:
+            assign_tile(read_tile(sample_groups[0], variant_groups[0]))
+        else:
+            max_in_flight_tiles = min(int(worker_count), int(total_tasks))
+            task_iter = iter(
+                (sample_group, variant_group)
+                for sample_group in sample_groups
+                for variant_group in variant_groups
+            )
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hapstore-read") as pool:
+                pending = set()
+                for _ in range(max_in_flight_tiles):
+                    sample_group, variant_group = next(task_iter)
+                    pending.add(pool.submit(read_tile, sample_group, variant_group))
+                while pending:
+                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        assign_tile(future.result())
+                        try:
+                            sample_group, variant_group = next(task_iter)
+                        except StopIteration:
+                            continue
+                        pending.add(pool.submit(read_tile, sample_group, variant_group))
         self._last_read_metrics = {
             "backend": "threaded",
             "dataset": arr_name,
@@ -858,6 +886,9 @@ class HapStore:
             "coalesce_min_density": float(min_density),
             "coalesce_min_density_source": min_density_source or "default",
             "n_tiles": int(total_tasks),
+            "max_in_flight_tiles": int(max_in_flight_tiles),
+            "estimated_tile_mb": float(estimated_tile_bytes / (1024.0**2)),
+            "output_mb": float(output_bytes / (1024.0**2)),
             "has_missing": bool(has_missing),
             "assume_no_missing": bool(assume_no_missing),
             "read_sec_sum": float(read_sec),
@@ -1518,24 +1549,53 @@ def _resolve_read_worker_count(
     row_chunk: int,
     variant_chunk: int,
     dataset: str,
+    estimated_tile_bytes: int | None = None,
+    output_bytes: int = 0,
 ) -> tuple[int, dict[str, Any]]:
-    max_task_workers = max(1, min(int(n_tasks), os.cpu_count() or 1))
+    available_cpus, cpu_source = _available_read_cpu_count()
+    max_task_workers = max(1, min(int(n_tasks), int(available_cpus)))
+    if estimated_tile_bytes is None:
+        row_factor = 1 if str(dataset) == "genotypes" else 2
+        estimated_tile_bytes = int(
+            min(max(1, int(row_chunk)), max(1, int(n_samples)))
+            * min(max(1, int(variant_chunk)), max(1, int(n_variants)))
+            * row_factor
+        )
+    estimated_tile_bytes = max(1, int(estimated_tile_bytes))
+    output_bytes = max(0, int(output_bytes))
+    estimated_tile_mb = float(estimated_tile_bytes / (1024.0**2))
+    available_memory_bytes, memory_source = _available_read_memory_bytes(available_cpus)
+
+    base_policy = {
+        "auto_estimated_tile_mb": estimated_tile_mb,
+        "auto_output_mb": float(output_bytes / (1024.0**2)),
+        "auto_available_cpus": int(available_cpus),
+        "auto_cpu_source": str(cpu_source),
+        "auto_available_memory_mb": (
+            float(available_memory_bytes / (1024.0**2))
+            if available_memory_bytes is not None
+            else float("nan")
+        ),
+        "auto_memory_source": str(memory_source),
+    }
     explicit_workers = _parse_positive_worker_count(workers)
     if explicit_workers is not None:
         resolved = max(1, min(int(explicit_workers), max_task_workers))
         return resolved, {
+            **base_policy,
             "auto_worker_source": "explicit",
             "auto_worker_cap": float("nan"),
-            "auto_estimated_tile_mb": float("nan"),
+            "auto_memory_worker_cap": float("nan"),
         }
 
     env_workers, env_name = _env_positive_int(("HAPSTORE_READ_WORKERS", "HAPSTORE_AUTO_READ_WORKERS"))
     if env_workers is not None:
         resolved = max(1, min(int(env_workers), max_task_workers))
         return resolved, {
+            **base_policy,
             "auto_worker_source": str(env_name),
             "auto_worker_cap": float("nan"),
-            "auto_estimated_tile_mb": float("nan"),
+            "auto_memory_worker_cap": float("nan"),
         }
 
     auto_cap, cap_source = _env_positive_int(
@@ -1543,11 +1603,6 @@ def _resolve_read_worker_count(
         default=16,
     )
     assert auto_cap is not None
-
-    input_rows = min(max(1, int(row_chunk)), max(1, int(n_samples)))
-    input_cols = min(max(1, int(variant_chunk)), max(1, int(n_variants)))
-    row_factor = 1 if str(dataset) == "genotypes" else 2
-    estimated_tile_mb = float(input_rows * input_cols * row_factor / (1024.0**2))
 
     tasks = max(1, int(n_tasks))
     if tasks <= 1:
@@ -1569,15 +1624,117 @@ def _resolve_read_worker_count(
         target = 16
         source = "large_tile_grid"
 
-    resolved = max(1, min(int(target), int(auto_cap), max_task_workers))
+    if available_memory_bytes is None:
+        memory_budget_bytes = None
+        memory_worker_cap = max_task_workers
+    else:
+        memory_budget_bytes = max(
+            0,
+            int(float(available_memory_bytes) * _AUTO_READ_TILE_MEMORY_FRACTION) - output_bytes,
+        )
+        memory_worker_cap = max(1, int(memory_budget_bytes // estimated_tile_bytes))
+
+    resolved = max(
+        1,
+        min(int(target), int(auto_cap), max_task_workers, int(memory_worker_cap)),
+    )
     cap_label = cap_source if cap_source is not None else "default"
     return resolved, {
+        **base_policy,
         "auto_worker_source": source,
         "auto_worker_cap": int(auto_cap),
         "auto_worker_cap_source": cap_label,
-        "auto_estimated_tile_mb": estimated_tile_mb,
+        "auto_memory_worker_cap": int(memory_worker_cap),
+        "auto_memory_budget_mb": (
+            float(memory_budget_bytes / (1024.0**2))
+            if memory_budget_bytes is not None
+            else float("nan")
+        ),
         "auto_max_task_workers": int(max_task_workers),
     }
+
+
+def _available_read_cpu_count() -> tuple[int, str]:
+    """Return the CPU budget visible to this process and its limiting source."""
+    candidates: list[tuple[str, int]] = []
+    affinity = getattr(os, "sched_getaffinity", None)
+    if affinity is not None:
+        try:
+            count = len(affinity(0))
+            if count > 0:
+                candidates.append(("sched_getaffinity", int(count)))
+        except (AttributeError, NotImplementedError, OSError):
+            pass
+
+    slurm_raw = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_raw:
+        try:
+            slurm_count = int(slurm_raw)
+        except ValueError:
+            slurm_count = 0
+        if slurm_count > 0:
+            candidates.append(("SLURM_CPUS_PER_TASK", slurm_count))
+
+    system_count = os.cpu_count() or 1
+    candidates.append(("os.cpu_count", max(1, int(system_count))))
+    count = min(value for _source, value in candidates)
+    limiting_sources = [source for source, value in candidates if value == count]
+    return int(count), "+".join(limiting_sources)
+
+
+def _available_read_memory_bytes(cpu_count: int) -> tuple[int | None, str]:
+    """Return the most restrictive observable memory allowance in bytes."""
+    mib = 1024**2
+    candidates: list[tuple[str, int]] = []
+
+    for name, multiplier in (
+        ("SLURM_MEM_PER_NODE", 1),
+        ("SLURM_MEM_PER_CPU", max(1, int(cpu_count))),
+    ):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            value = int(raw) * int(multiplier) * mib
+        except ValueError:
+            continue
+        if value > 0:
+            candidates.append((name, value))
+
+    cgroup_pairs = (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    )
+    for limit_path, current_path in cgroup_pairs:
+        try:
+            raw_limit = limit_path.read_text(encoding="utf-8").strip()
+            if raw_limit == "max":
+                continue
+            limit = int(raw_limit)
+            current = int(current_path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        available = limit - current
+        if 0 < available < (1 << 60):
+            candidates.append(("cgroup", available))
+            break
+
+    meminfo = Path("/proc/meminfo")
+    try:
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                candidates.append(("proc_memavailable", int(line.split()[1]) * 1024))
+                break
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        pass
+
+    if not candidates:
+        return None, "unavailable"
+    source, value = min(candidates, key=lambda item: item[1])
+    return int(value), str(source)
 
 
 def _make_read_groups(indices: np.ndarray, *, chunk_size: int, limit: int) -> list[_ReadGroup]:
