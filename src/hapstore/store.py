@@ -494,7 +494,11 @@ class HapStore:
         data: str = "genotypes",
         dtype: str | np.dtype = "uint8",
     ) -> Iterator[HapStoreBlock]:
-        """Yield chunk-aligned variant-axis blocks with aligned metadata."""
+        """Yield variant blocks in caller order with aligned metadata.
+
+        Sparse explicit indices are read as chunk-local spans. Yielded blocks
+        still follow ``block_size`` and preserve duplicate indices.
+        """
         axis_name = str(axis).lower()
         if axis_name != "variants":
             raise ValueError(f"axis must be 'variants', got {axis!r}")
@@ -676,8 +680,8 @@ class HapStore:
     ) -> np.ndarray:
         """Read dosages with chunk-aware threaded 2D tiling.
 
-        Output columns follow the requested variant order. ``workers=1`` or
-        ``backend="serial"`` preserves the historical contiguous-span read path.
+        Output columns follow the requested variant order. The serial path uses
+        one span for dense requests and chunk-local spans for sparse requests.
         """
         chrom_group = self._require_chromosome(chrom)
         variant_idx = self._resolve_variant_indices(
@@ -908,9 +912,6 @@ class HapStore:
         sample_indices: np.ndarray,
         dtype: np.dtype,
     ) -> np.ndarray:
-        span_start = int(np.min(variant_indices))
-        span_stop = int(np.max(variant_indices)) + 1
-        offsets = np.asarray(variant_indices - span_start, dtype=np.int64)
         n_variants = int(variant_indices.size)
 
         if data == "haplotypes":
@@ -920,13 +921,12 @@ class HapStore:
             hap_indices = np.empty(sample_indices.size * 2, dtype=np.int64)
             hap_indices[0::2] = 2 * sample_indices
             hap_indices[1::2] = (2 * sample_indices) + 1
-            n_total = self.n_samples(chrom)
-            if sample_indices.size > n_total // 2:
-                full = np.asarray(arr[:, span_start:span_stop], dtype=np.uint8)
-                block = full[hap_indices]
-            else:
-                block = np.asarray(arr.oindex[hap_indices, slice(span_start, span_stop)], dtype=np.uint8)
-            return np.asarray(block[:, offsets], dtype=dtype)
+            block = _read_chunk_grouped_array(
+                arr,
+                row_indices=hap_indices,
+                variant_indices=variant_indices,
+            )
+            return np.asarray(block, dtype=dtype)
 
         if data != "genotypes":
             raise ValueError(f"data must be one of 'genotypes' or 'haplotypes', got {data!r}")
@@ -934,13 +934,12 @@ class HapStore:
             return np.empty((0, n_variants), dtype=dtype)
         if "genotypes" in chrom_group:
             arr = chrom_group["genotypes"]
-            n_total = self.n_samples(chrom)
-            if sample_indices.size > n_total // 2:
-                full = np.asarray(arr[:, span_start:span_stop], dtype=np.uint8)
-                block = full[sample_indices]
-            else:
-                block = np.asarray(arr.oindex[sample_indices, slice(span_start, span_stop)], dtype=np.uint8)
-            return np.asarray(block[:, offsets], dtype=dtype)
+            block = _read_chunk_grouped_array(
+                arr,
+                row_indices=sample_indices,
+                variant_indices=variant_indices,
+            )
+            return np.asarray(block, dtype=dtype)
 
         haps = self._read_block_values(
             chrom_group=chrom_group,
@@ -958,17 +957,28 @@ class HapStore:
         chrom_group: zarr.Group,
         variant_indices: np.ndarray,
     ) -> dict[str, Any]:
-        span_start = int(np.min(variant_indices))
-        span_stop = int(np.max(variant_indices)) + 1
-        offsets = np.asarray(variant_indices - span_start, dtype=np.int64)
         variants = chrom_group["variants"]
-        positions = np.asarray(variants["pos"][span_start:span_stop], dtype=np.int64)[offsets]
-        ref = _to_unicode_array(np.asarray(variants["ref"][span_start:span_stop], dtype=object))[offsets]
-        alt = _to_unicode_array(np.asarray(variants["alt"][span_start:span_stop], dtype=object))[offsets]
-        vid = _to_unicode_array(np.asarray(variants["vid"][span_start:span_stop], dtype=object))[offsets]
-        genetic = None
-        if "genetic_pos" in variants:
-            genetic = np.asarray(variants["genetic_pos"][span_start:span_stop], dtype=np.float64)[offsets]
+        n_variants = int(variant_indices.size)
+        groups = _plan_variant_read_groups(
+            variant_indices,
+            chunk_size=int(variants["pos"].chunks[0]),
+            limit=int(variants["pos"].shape[0]),
+        )
+        positions = np.empty(n_variants, dtype=np.int64)
+        ref = np.empty(n_variants, dtype=object)
+        alt = np.empty(n_variants, dtype=object)
+        vid = np.empty(n_variants, dtype=object)
+        genetic = np.empty(n_variants, dtype=np.float64) if "genetic_pos" in variants else None
+        for group in groups:
+            span = slice(int(group.start), int(group.stop))
+            out_pos = group.out_positions
+            offsets = group.offsets
+            positions[out_pos] = np.asarray(variants["pos"][span], dtype=np.int64)[offsets]
+            ref[out_pos] = _to_unicode_array(np.asarray(variants["ref"][span], dtype=object))[offsets]
+            alt[out_pos] = _to_unicode_array(np.asarray(variants["alt"][span], dtype=object))[offsets]
+            vid[out_pos] = _to_unicode_array(np.asarray(variants["vid"][span], dtype=object))[offsets]
+            if genetic is not None:
+                genetic[out_pos] = np.asarray(variants["genetic_pos"][span], dtype=np.float64)[offsets]
         return {
             "positions": np.asarray(positions, dtype=np.int64),
             "ref": tuple(str(x) for x in ref),
@@ -1206,32 +1216,54 @@ class HapStore:
         missing: str,
         assume_no_missing: bool,
     ) -> np.ndarray:
+        chrom_group = self._require_chromosome(chrom)
+        dataset = "genotypes" if "genotypes" in chrom_group else "haplotypes"
+        arr = chrom_group[dataset]
+        variant_groups = _plan_variant_read_groups(
+            variant_indices,
+            chunk_size=int(arr.chunks[1]),
+            limit=int(arr.shape[1]),
+        )
         span_start = int(np.min(variant_indices))
         span_stop = int(np.max(variant_indices)) + 1
         read_start = time.perf_counter()
-        geno = self.genotypes(chrom, variant_slice=(span_start, span_stop))
+        values = self._read_block_values(
+            chrom_group=chrom_group,
+            chrom=chrom,
+            data="genotypes",
+            variant_indices=variant_indices,
+            sample_indices=sample_indices,
+            dtype=np.dtype("uint8"),
+        )
         read_sec = time.perf_counter() - read_start
-        slice_start = time.perf_counter()
-        cols = np.asarray(variant_indices - span_start, dtype=np.int64)
-        values = geno[np.ix_(sample_indices, cols)]
+        format_start = time.perf_counter()
+        has_missing = bool(self.attrs(chrom).get("has_missing", True)) and not bool(assume_no_missing)
         out = _format_genotype_values(
             values,
             dtype=dtype,
             missing=missing,
-            has_missing=bool(self.attrs(chrom).get("has_missing", True)) and not bool(assume_no_missing),
+            has_missing=has_missing,
         )
+        format_sec = time.perf_counter() - format_start
+        read_span_variants = int(sum(int(group.stop) - int(group.start) for group in variant_groups))
         self._last_read_metrics = {
             "backend": "serial",
-            "dataset": "genotypes" if "genotypes" in self._require_chromosome(chrom) else "haplotypes",
+            "dataset": dataset,
             "workers": 1,
             "n_samples": int(sample_indices.size),
             "n_variants": int(variant_indices.size),
+            "n_unique_variants": int(np.unique(variant_indices).size),
             "span_variants": int(span_stop - span_start),
-            "has_missing": bool(self.attrs(chrom).get("has_missing", True)) and not bool(assume_no_missing),
+            "read_span_variants": read_span_variants,
+            "max_read_span_variants": int(
+                max(int(group.stop) - int(group.start) for group in variant_groups)
+            ),
+            "variant_groups": int(len(variant_groups)),
+            "has_missing": has_missing,
             "assume_no_missing": bool(assume_no_missing),
             "read_sec_sum": float(read_sec),
-            "assign_sec": float(time.perf_counter() - slice_start),
-            "total_sec": float(read_sec + (time.perf_counter() - slice_start)),
+            "assign_sec": float(format_sec),
+            "total_sec": float(read_sec + format_sec),
         }
         return out
 
@@ -1760,6 +1792,63 @@ def _make_read_groups(indices: np.ndarray, *, chunk_size: int, limit: int) -> li
             )
         )
     return groups
+
+
+def _plan_variant_read_groups(
+    indices: np.ndarray,
+    *,
+    chunk_size: int,
+    limit: int,
+) -> list[_ReadGroup]:
+    """Use one span for dense requests and bounded chunk spans for sparse ones."""
+    indices_arr = np.asarray(indices, dtype=np.int64)
+    groups = _make_read_groups(indices_arr, chunk_size=chunk_size, limit=limit)
+    if len(groups) <= 1:
+        return groups
+    span_start = int(np.min(indices_arr))
+    span_stop = int(np.max(indices_arr)) + 1
+    if int(np.unique(indices_arr).size) != int(span_stop - span_start):
+        return groups
+
+    out_positions = np.arange(indices_arr.size, dtype=np.int64)
+    order = np.lexsort((out_positions, indices_arr))
+    return [
+        _ReadGroup(
+            start=span_start,
+            stop=span_stop,
+            offsets=np.asarray(indices_arr[order] - span_start, dtype=np.int64),
+            out_positions=np.asarray(out_positions[order], dtype=np.int64),
+        )
+    ]
+
+
+def _read_chunk_grouped_array(
+    arr: zarr.Array,
+    *,
+    row_indices: np.ndarray,
+    variant_indices: np.ndarray,
+) -> np.ndarray:
+    """Read planned variant spans and restore requested row/column ordering."""
+    rows = np.asarray(row_indices, dtype=np.int64)
+    variants = np.asarray(variant_indices, dtype=np.int64)
+    out = np.empty((rows.size, variants.size), dtype=np.dtype(arr.dtype))
+    if rows.size == 0 or variants.size == 0:
+        return out
+
+    groups = _plan_variant_read_groups(
+        variants,
+        chunk_size=int(arr.chunks[1]),
+        limit=int(arr.shape[1]),
+    )
+    for group in groups:
+        span = slice(int(group.start), int(group.stop))
+        if rows.size > int(arr.shape[0]) // 2:
+            dense = np.asarray(arr[:, span], dtype=arr.dtype)
+            block = dense[rows]
+        else:
+            block = np.asarray(arr.oindex[rows, span], dtype=arr.dtype)
+        out[:, group.out_positions] = block[:, group.offsets]
+    return out
 
 
 def _coalesce_read_groups(

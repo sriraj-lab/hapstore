@@ -311,6 +311,70 @@ def test_read_dosages_worker_counts_are_equal(tmp_path, synthetic_arrays):
     np.testing.assert_allclose(one, many, equal_nan=True)
 
 
+@pytest.mark.parametrize("store_genotypes", [False, True])
+def test_sparse_serial_reads_are_chunk_bounded_and_preserve_order(tmp_path, store_genotypes):
+    n_variants = 16
+    alternating = np.arange(n_variants, dtype=np.uint8) % 2
+    haplotypes = np.vstack(
+        [alternating, 1 - alternating, np.zeros(n_variants, dtype=np.uint8), alternating]
+    )
+    haplotypes[:, 15] = 255
+    store = HapStore(tmp_path / f"sparse_serial_{store_genotypes}.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        haplotypes=haplotypes,
+        variant_pos=np.arange(1, n_variants + 1, dtype=np.int64) * 100,
+        sample_ids=np.asarray(["s1", "s2"], dtype=object),
+        ref=np.asarray(["A"] * n_variants, dtype=object),
+        alt=np.asarray(["G"] * n_variants, dtype=object),
+        vid=np.asarray([f"v{i}" for i in range(n_variants)], dtype=object),
+        genetic_positions=np.arange(n_variants, dtype=np.float64) / 10.0,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+        chunk_sample_size=1,
+        store_genotypes=store_genotypes,
+    )
+    requested_variants = np.asarray([15, 0, 15, 8], dtype=np.int64)
+    requested_samples = np.asarray([1, 0, 1], dtype=np.int64)
+    expected_u8 = store.genotypes("1")[np.ix_(requested_samples, requested_variants)]
+    expected = expected_u8.astype(np.float32)
+    expected[expected_u8 == 255] = np.nan
+
+    observed = store.read_dosages(
+        "1",
+        variant_indices=requested_variants,
+        sample_indices=requested_samples,
+        workers=1,
+    )
+    sparse_metrics = store.last_read_metrics
+
+    np.testing.assert_allclose(observed, expected, equal_nan=True)
+    assert sparse_metrics["span_variants"] == 16
+    assert sparse_metrics["read_span_variants"] == 3
+    assert sparse_metrics["max_read_span_variants"] == 1
+    assert sparse_metrics["variant_groups"] == 3
+
+    blocks = list(
+        store.iter_blocks(
+            "1",
+            block_size=4,
+            variant_indices=requested_variants,
+            sample_indices=requested_samples,
+            data="genotypes",
+        )
+    )
+    assert len(blocks) == 1
+    np.testing.assert_array_equal(blocks[0].values, expected_u8)
+    np.testing.assert_array_equal(blocks[0].variant_indices, requested_variants)
+    assert blocks[0].vid == ("v15", "v0", "v15", "v8")
+    np.testing.assert_array_equal(blocks[0].positions, np.asarray([1600, 100, 1600, 900]))
+
+    store.read_dosages("1", variant_indices=np.arange(n_variants), workers=1)
+    dense_metrics = store.last_read_metrics
+    assert dense_metrics["variant_groups"] == 1
+    assert dense_metrics["read_span_variants"] == n_variants
+
+
 def test_read_dosages_auto_workers_match_serial(tmp_path, synthetic_arrays, monkeypatch):
     store = HapStore(tmp_path / "dosage_auto_workers.zarr", mode="w")
     store.create_chromosome(
