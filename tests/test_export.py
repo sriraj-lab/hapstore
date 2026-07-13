@@ -304,6 +304,15 @@ def test_export_vcf_via_pgen_cleanup_is_covered_without_plink(monkeypatch, tmp_p
         return prefix
 
     def fake_run_cmd(cmd, **_kwargs):
+        if "--pmerge-list" in cmd:
+            merge_list = Path(cmd[cmd.index("--pmerge-list") + 1])
+            for line in merge_list.read_text(encoding="utf-8").splitlines():
+                prefix = Path(line)
+                for ext in (".pgen", ".pvar", ".psam"):
+                    assert Path(f"{prefix}{ext}").exists()
+            merged_prefix = Path(cmd[cmd.index("--out") + 1])
+            for ext in (".pgen", ".pvar", ".psam"):
+                Path(f"{merged_prefix}{ext}").write_text("stub\n", encoding="utf-8")
         if "--export" in cmd:
             out_prefix = Path(cmd[cmd.index("--out") + 1])
             Path(f"{out_prefix}.vcf").write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
@@ -311,14 +320,16 @@ def test_export_vcf_via_pgen_cleanup_is_covered_without_plink(monkeypatch, tmp_p
     monkeypatch.setattr(pgen_mod, "export_pgen", fake_export_pgen)
     monkeypatch.setattr(command_mod, "run_cmd", fake_run_cmd)
 
+    store_path = tmp_path / "mock_cleanup_store.zarr"
+    _build_store_for_export(store_path)
     output_vcf = tmp_path / "mock_cleanup.vcf"
     result = export_vcf(
-        store_path=tmp_path / "unused.zarr",
+        store_path=store_path,
         output_vcf=output_vcf,
         chrom="1",
         bgzip=False,
         plink2_location="system",
-        n_shards=1,
+        n_shards=2,
         keep_intermediate_files=False,
     )
 

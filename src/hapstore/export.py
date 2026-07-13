@@ -270,9 +270,8 @@ def _export_vcf_via_pgen(
                 shard_indices_list = [p.astype(int).tolist() for p in parts if p.size > 0]
 
             for shard_idx, shard_indices in enumerate(shard_indices_list):
-                shard_prefix = work_dir / f"{export_prefix.name}.shard{shard_idx}.pgen"
-                shard_prefixes.append(shard_prefix)
-                export_pgen(
+                shard_prefix = work_dir / f"{export_prefix.name}.shard{shard_idx}"
+                shard_prefix = export_pgen(
                     store_path=store_path,
                     out_prefix=shard_prefix,
                     chrom=chrom_key,
@@ -282,6 +281,7 @@ def _export_vcf_via_pgen(
                     strict_biallelic=True,
                     on_partial_missing="error",
                 )
+                shard_prefixes.append(Path(shard_prefix))
 
             # Merge shards into one PGEN triplet.
             pmerge_list = work_dir / f"{export_prefix.name}.pmerge_list.txt"
