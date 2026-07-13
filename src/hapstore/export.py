@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable

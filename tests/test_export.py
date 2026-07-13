@@ -290,6 +290,43 @@ def test_export_vcf_via_pgen_removes_intermediates_by_default(tmp_path):
     assert not list(tmp_path.glob("hapstore_export_vcf_*"))
 
 
+def test_export_vcf_via_pgen_cleanup_is_covered_without_plink(monkeypatch, tmp_path):
+    import hapstore.export as export_mod
+    import hapstore.pgen as pgen_mod
+    from hapstore._internal import command as command_mod
+
+    monkeypatch.setattr(export_mod, "resolve_plink2_binary", lambda _location: Path("plink2"))
+
+    def fake_export_pgen(*, out_prefix, **_kwargs):
+        prefix = Path(out_prefix)
+        for ext in (".pgen", ".pvar", ".psam"):
+            Path(f"{prefix}{ext}").write_text("stub\n", encoding="utf-8")
+        return prefix
+
+    def fake_run_cmd(cmd, **_kwargs):
+        if "--export" in cmd:
+            out_prefix = Path(cmd[cmd.index("--out") + 1])
+            Path(f"{out_prefix}.vcf").write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+
+    monkeypatch.setattr(pgen_mod, "export_pgen", fake_export_pgen)
+    monkeypatch.setattr(command_mod, "run_cmd", fake_run_cmd)
+
+    output_vcf = tmp_path / "mock_cleanup.vcf"
+    result = export_vcf(
+        store_path=tmp_path / "unused.zarr",
+        output_vcf=output_vcf,
+        chrom="1",
+        bgzip=False,
+        plink2_location="system",
+        n_shards=1,
+        keep_intermediate_files=False,
+    )
+
+    assert result == output_vcf
+    assert output_vcf.exists()
+    assert not list(tmp_path.glob("hapstore_export_vcf_*"))
+
+
 def test_subset_samples_to_new_store_streams_and_preserves_order(monkeypatch, tmp_path):
     from hapstore.store import HapStore as HapStoreClass
 
