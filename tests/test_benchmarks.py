@@ -4,7 +4,7 @@ import csv
 import json
 
 import numpy as np
-
+from benchmarks.bench_chunk_layout import main as chunk_layout_main
 from benchmarks.bench_pgen_export import main as pgen_export_main
 from benchmarks.bench_read_dosages import main
 from hapstore import HapStore
@@ -22,10 +22,10 @@ def _make_benchmark_store(path):
         chrom="1",
         haplotypes=haplotypes,
         variant_pos=np.arange(100, 100 + n_variants, dtype=np.int64),
-        sample_ids=np.asarray([f"s{i+1}" for i in range(n_samples)], dtype=object),
+        sample_ids=np.asarray([f"s{i + 1}" for i in range(n_samples)], dtype=object),
         ref=np.asarray(["A"] * n_variants, dtype=object),
         alt=np.asarray(["G"] * n_variants, dtype=object),
-        vid=np.asarray([f"v{i+1}" for i in range(n_variants)], dtype=object),
+        vid=np.asarray([f"v{i + 1}" for i in range(n_variants)], dtype=object),
         chunk_variant_size=6,
         chunk_haplotype_size=8,
         chunk_sample_size=4,
@@ -97,6 +97,72 @@ def test_bench_read_dosages_cli_writes_rows_and_metadata(tmp_path):
     assert metadata["store_metadata"]["n_samples"] == 12
     assert metadata["store_metadata"]["n_variants"] == 48
     assert metadata["store_metadata"]["dataset"] == "genotypes"
+
+
+def test_bench_chunk_layout_cli_writes_and_compares_layouts(tmp_path):
+    store_path = _make_benchmark_store(tmp_path / "source.zarr")
+    out_dir = tmp_path / "chunk_results"
+    work_dir = tmp_path / "chunk_work"
+
+    exit_code = chunk_layout_main(
+        [
+            "--source-store",
+            str(store_path),
+            "--chrom",
+            "1",
+            "--work-dir",
+            str(work_dir),
+            "--out-dir",
+            str(out_dir),
+            "--layout",
+            "full:6:full",
+            "--layout",
+            "bounded:12:8",
+            "--sample-count",
+            "8",
+            "--variant-start",
+            "4",
+            "--variant-count",
+            "24",
+            "--read-case",
+            "full_contiguous,low_fraction,batch_union",
+            "--read-workers",
+            "1",
+            "--read-reps",
+            "1",
+            "--read-warmups",
+            "0",
+            "--contiguous-variants",
+            "12",
+            "--sparse-variants",
+            "5",
+            "--batch-requests",
+            "2",
+            "--batch-window-size",
+            "4",
+        ]
+    )
+    assert exit_code == 0
+
+    with (out_dir / "layout_summary.tsv").open("r", encoding="utf-8") as handle:
+        summary = list(csv.DictReader(handle, delimiter="\t"))
+    assert [row["layout"] for row in summary] == ["full", "bounded"]
+    assert [row["haplotype_chunks_actual"] for row in summary] == ["16x6", "8x12"]
+    assert all(row["correctness_pass"] == "True" for row in summary)
+
+    with (out_dir / "read_benchmark_rows.tsv").open("r", encoding="utf-8") as handle:
+        reads = list(csv.DictReader(handle, delimiter="\t"))
+    assert len(reads) == 6
+    assert {row["layout"] for row in reads} == {"full", "bounded"}
+    assert all(row["correctness_pass"] == "True" for row in reads)
+    assert not any(work_dir.iterdir())
+
+    metadata = json.loads(
+        (out_dir / "benchmark_metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["status"] == "complete"
+    assert metadata["source_shape"] == [16, 24]
+    assert metadata["completed_layouts"] == ["full", "bounded"]
 
 
 def test_bench_pgen_export_cli_runs_component_timings(tmp_path, capsys):
