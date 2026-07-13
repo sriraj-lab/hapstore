@@ -261,6 +261,35 @@ def test_export_vcf_via_pgen_preserves_content(tmp_path):
         assert Path(f"{merged_prefix}{ext}").exists()
 
 
+def test_export_vcf_via_pgen_removes_intermediates_by_default(tmp_path):
+    try:
+        import pgenlib  # noqa: F401
+    except Exception:
+        pytest.skip("pgenlib is required for PGEN-backed VCF export test")
+    if shutil.which("plink2") is None:
+        pytest.skip("plink2 binary is required for PGEN-backed VCF export test")
+
+    store_path = tmp_path / "cleanup_store.zarr"
+    _build_store_for_export(store_path)
+    output_vcf = tmp_path / "cleanup.vcf"
+
+    result = export_vcf(
+        store_path=store_path,
+        output_vcf=output_vcf,
+        chrom="1",
+        bgzip=False,
+        plink2_location="system",
+        n_shards=2,
+        keep_intermediate_files=False,
+    )
+
+    assert result == output_vcf
+    assert output_vcf.exists()
+    assert not list(tmp_path.glob("cleanup.merged_pgen.*"))
+    assert not list(tmp_path.glob("cleanup.shard*.pgen.*"))
+    assert not list(tmp_path.glob("hapstore_export_vcf_*"))
+
+
 def test_subset_samples_to_new_store_streams_and_preserves_order(monkeypatch, tmp_path):
     from hapstore.store import HapStore as HapStoreClass
 

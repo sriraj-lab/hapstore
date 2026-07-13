@@ -112,9 +112,10 @@ def load_genetic_map(path: str | Path, chrom: str | int | None = None) -> pd.Dat
     chrom_col, pos_col, cm_col = _choose_columns(df, has_header=has_header)
 
     if chrom_col == "_chrom":
+        map_chrom = "" if chrom is None else normalize_chrom(chrom, prefix=False)
         normalized = pd.DataFrame(
             {
-                "chrom": "",
+                "chrom": map_chrom,
                 "position_bp": pd.to_numeric(df.iloc[:, int(pos_col)], errors="coerce"),
                 "position_cm": pd.to_numeric(df.iloc[:, int(cm_col)], errors="coerce"),
             }

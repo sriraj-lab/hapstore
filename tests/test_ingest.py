@@ -140,6 +140,31 @@ def test_ingest_vcf_with_genetic_map(tmp_path):
     np.testing.assert_allclose(gpos, np.asarray([0.10, 0.30], dtype=float))
 
 
+def test_ingest_vcf_with_two_column_chromosome_map(tmp_path):
+    vcf = write_text_vcf(
+        tmp_path / "two_column.vcf",
+        rows=[
+            ("chr1", 100, "rs1", "A", "G", ["0|1", "1|1"]),
+            ("chr1", 200, "rs2", "C", "T", ["0|0", "0|1"]),
+        ],
+    )
+    gmap = tmp_path / "two_column.map"
+    gmap.write_text("100 0.10\n200 0.30\n", encoding="utf-8")
+
+    store = ingest_vcf(
+        vcf_path=vcf,
+        output_zarr=tmp_path / "two_column_map.zarr",
+        chrom="1",
+        backend="text",
+        genetic_map_path=gmap,
+    )
+
+    np.testing.assert_allclose(
+        store.genetic_positions("1"),
+        np.asarray([0.10, 0.30], dtype=float),
+    )
+
+
 def test_ingest_vcf_missing_genotypes_kept_as_255(tmp_path):
     vcf = write_text_vcf(
         tmp_path / "missing.vcf",

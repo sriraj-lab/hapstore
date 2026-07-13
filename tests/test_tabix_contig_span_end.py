@@ -80,3 +80,26 @@ def test_build_shard_ranges_uses_tabix_when_contig_length_missing(tmp_path, monk
     assert int(last_end) >= 3_000_000
     assert int(last_end) <= 3_000_000 + (1 << 14)
 
+
+def test_csi_span_parser_uses_real_index_header_and_bins(tmp_path):
+    from hapstore._internal._ingest_index import _resolve_contig_span_end_from_tabix_index
+
+    vcf_path = _write_indexed_pysam_vcf_missing_contig_length(
+        tmp_path / "csi.vcf.gz",
+        records=[
+            (100, "rs1", "A", "G", (0, 1, True), (1, 1, True)),
+            (3_000_000, "rs2", "G", "A", (1, 0, True), (0, 0, True)),
+        ],
+    )
+
+    import pysam
+
+    Path(f"{vcf_path}.tbi").unlink()
+    pysam.tabix_index(str(vcf_path), preset="vcf", force=True, csi=True)
+
+    csi_path = Path(f"{vcf_path}.csi")
+    assert csi_path.exists()
+    span_end = _resolve_contig_span_end_from_tabix_index(vcf_path, "chr1")
+    assert span_end is not None
+    assert int(span_end) >= 3_000_000
+    assert int(span_end) <= 3_000_000 + (1 << 14)

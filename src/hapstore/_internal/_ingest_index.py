@@ -67,25 +67,29 @@ def _contig_span_end_from_csi(csi_path: Path, contig: str) -> int | None:
             magic = f.read(4)
             if magic != b"CSI\x01":
                 return None
-            n_ref = _read_int32(f)
             min_shift = _read_int32(f)
-            _depth = _read_int32(f)
+            depth = _read_int32(f)
             l_aux = _read_int32(f)
             aux = f.read(int(l_aux))
             rid = _resolve_ref_id_from_csi_aux(aux, contig_b)
             if rid is None:
                 return None
+            n_ref = _read_int32(f)
 
             for ref_idx in range(int(n_ref)):
                 n_bin = _read_int32(f)
+                span_end = None
                 for _ in range(int(n_bin)):
-                    f.read(4)  # bin
+                    bin_id = _read_uint32(f)
+                    f.read(8)  # loffset
                     n_chunk = _read_int32(f)
                     f.seek(16 * int(n_chunk), os.SEEK_CUR)
-                n_intv = _read_int32(f)
+                    if ref_idx == int(rid):
+                        bin_end = _csi_bin_span_end(bin_id, min_shift=min_shift, depth=depth)
+                        if bin_end is not None:
+                            span_end = max(int(span_end or 0), int(bin_end))
                 if ref_idx == int(rid):
-                    return int(n_intv) << int(min_shift)
-                f.seek(8 * int(n_intv), os.SEEK_CUR)
+                    return span_end
     except Exception:  # pragma: no cover
         return None
     return None
@@ -109,6 +113,18 @@ def _resolve_ref_id_from_csi_aux(aux: bytes, contig: bytes) -> int | None:
         return None
 
 
+def _csi_bin_span_end(bin_id: int, *, min_shift: int, depth: int) -> int | None:
+    """Return the exclusive genomic end represented by a regular CSI bin."""
+    bin_value = int(bin_id)
+    for level in range(int(depth) + 1):
+        first = ((1 << (3 * level)) - 1) // 7
+        next_first = ((1 << (3 * (level + 1))) - 1) // 7
+        if first <= bin_value < next_first:
+            shift = int(min_shift) + 3 * (int(depth) - level)
+            return int(bin_value - first + 1) << shift
+    return None
+
+
 def _open_tabix_index(index_path: Path):
     raw = index_path.open("rb")
     head = raw.read(2)
@@ -123,3 +139,10 @@ def _read_int32(f) -> int:
     if len(raw) != 4:
         raise EOFError("unexpected EOF while reading int32")
     return int(struct.unpack("<i", raw)[0])
+
+
+def _read_uint32(f) -> int:
+    raw = f.read(4)
+    if len(raw) != 4:
+        raise EOFError("unexpected EOF while reading uint32")
+    return int(struct.unpack("<I", raw)[0])
