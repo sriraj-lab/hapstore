@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import zarr
 
 from hapstore import HapStore, HapStoreDosageRequest
 from hapstore import store as store_module
@@ -69,7 +70,11 @@ def test_create_chromosome_rejects_invalid_contract_before_writing(tmp_path, syn
     assert store.has_chromosome("1") is False
 
 
-def test_variant_alias_lookup_rejects_ambiguous_positions(tmp_path, synthetic_arrays):
+def test_variant_alias_lookup_rejects_ambiguous_positions(
+    tmp_path,
+    synthetic_arrays,
+    monkeypatch,
+):
     store = HapStore(tmp_path / "ambiguous.zarr", mode="w")
     store.create_chromosome(
         chrom="1",
@@ -79,11 +84,78 @@ def test_variant_alias_lookup_rejects_ambiguous_positions(tmp_path, synthetic_ar
             "vid": ["v1", "v2", ".", "."],
         },
     )
+    alias_scans: list[set[str]] = []
+    original_alias_scanner = store._scan_variant_aliases
 
+    def recording_alias_scanner(**kwargs):
+        alias_scans.append(set(kwargs["aliases"]))
+        return original_alias_scanner(**kwargs)
+
+    monkeypatch.setattr(store, "_scan_variant_aliases", recording_alias_scanner)
+
+    with pytest.raises(ValueError, match="ambiguous variant alias"):
+        store.read_dosages("1", variant_ids=["1:100"])
     with pytest.raises(ValueError, match="ambiguous variant alias"):
         store.read_dosages("1", variant_ids=["1:100"])
     with pytest.raises(ValueError, match="missing"):
         store.read_dosages("1", variant_ids=["."])
+    with pytest.raises(ValueError, match="missing"):
+        store.read_dosages("1", variant_ids=["."])
+    assert alias_scans == [{"1:100"}, {"."}]
+
+
+def test_variant_id_resolution_scans_metadata_chunks_and_caches_requests(
+    tmp_path,
+    synthetic_arrays,
+    monkeypatch,
+):
+    store = HapStore(tmp_path / "chunked_aliases.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        **synthetic_arrays,
+        chunk_variant_size=2,
+        chunk_haplotype_size=2,
+    )
+    metadata_reads: list[tuple[str, slice]] = []
+    original_getitem = zarr.Array.__getitem__
+
+    def recording_getitem(array, selection):
+        if array.path.endswith("variants/vid") or array.path.endswith("variants/pos"):
+            metadata_reads.append((array.path, selection))
+        return original_getitem(array, selection)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", recording_getitem)
+    observed = store.read_dosages(
+        "1",
+        variant_ids=["v4", "1:100", "v4"],
+        workers=1,
+        missing="sentinel",
+    )
+    expected = store.genotypes("1")[:, [3, 0, 3]].astype(np.float32)
+
+    np.testing.assert_array_equal(observed, expected)
+    assert metadata_reads
+    assert all(isinstance(selection, slice) for _path, selection in metadata_reads)
+    assert all(
+        int(selection.stop) - int(selection.start) <= 2
+        for _path, selection in metadata_reads
+    )
+    assert store._variant_index_cache == {}
+    assert store._resolved_variant_alias_cache["chr1"] == {"v4": 3, "1:100": 0}
+
+    metadata_reads.clear()
+    cached = store.read_dosages(
+        "1",
+        variant_ids=["1:100", "v4"],
+        workers=1,
+        missing="sentinel",
+    )
+    np.testing.assert_array_equal(cached, store.genotypes("1")[:, [0, 3]].astype(np.float32))
+    assert metadata_reads == []
+
+    full_map = store.variant_index_map("1")
+    assert full_map["v1"] == 0
+    assert full_map["chr1:400"] == 3
 
 
 def test_delete_chromosome(tmp_path, synthetic_arrays):
@@ -601,7 +673,7 @@ def test_variant_maf_haplotype_fallback_matches_stored_and_filters_in_request_or
     np.testing.assert_array_equal(hap_table["alt_allele_count"], stored_table["alt_allele_count"])
 
 
-def test_read_dosage_batch_window_matrix_and_project(tmp_path, synthetic_arrays):
+def test_read_dosage_batch_window_matrix_and_project(tmp_path, synthetic_arrays, monkeypatch):
     store = HapStore(tmp_path / "dosage_batch.zarr", mode="w")
     store.create_chromosome(
         chrom="1",
@@ -610,14 +682,39 @@ def test_read_dosage_batch_window_matrix_and_project(tmp_path, synthetic_arrays)
         chunk_haplotype_size=2,
     )
 
+    selected_metadata: list[np.ndarray] = []
+    alias_scans: list[set[str]] = []
+    original_metadata_reader = store._read_variant_metadata_block
+    original_alias_scanner = store._scan_variant_aliases
+
+    def recording_metadata_reader(**kwargs):
+        selected_metadata.append(np.asarray(kwargs["variant_indices"], dtype=np.int64))
+        return original_metadata_reader(**kwargs)
+
+    def recording_alias_scanner(**kwargs):
+        alias_scans.append(set(kwargs["aliases"]))
+        return original_alias_scanner(**kwargs)
+
+    monkeypatch.setattr(store, "_read_variant_metadata_block", recording_metadata_reader)
+    monkeypatch.setattr(store, "_scan_variant_aliases", recording_alias_scanner)
+    monkeypatch.setattr(
+        store,
+        "variant_info",
+        lambda _chrom: (_ for _ in ()).throw(AssertionError("full metadata read")),
+    )
     batch = store.read_dosage_batch(
         "1",
         [
             HapStoreDosageRequest("a", variant_ids=["v3", "v1"]),
-            {"request_id": "b", "variant_indices": [1, 2]},
+            {"request_id": "b", "variant_ids": ["v2", "v3"]},
+            ("c", [1, 2]),
         ],
         workers=4,
     )
+    assert alias_scans == [{"v1", "v2", "v3"}]
+    assert len(selected_metadata) == 1
+    np.testing.assert_array_equal(selected_metadata[0], np.asarray([0, 1, 2]))
+    assert batch.variant_ids == ("v1", "v2", "v3")
     expected_a = store.read_dosages("1", variant_ids=["v3", "v1"], workers=1)
     np.testing.assert_allclose(batch.window_matrix("a"), expected_a, equal_nan=True)
 

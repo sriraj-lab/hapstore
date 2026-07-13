@@ -100,6 +100,8 @@ class HapStore:
 
         self._root = zarr.open(str(self._path), mode=mode)
         self._variant_index_cache: dict[str, dict[str, int]] = {}
+        self._resolved_variant_alias_cache: dict[str, dict[str, int]] = {}
+        self._missing_variant_alias_cache: dict[str, set[str]] = {}
         self._ambiguous_variant_alias_cache: dict[str, set[str]] = {}
         self._last_read_metrics: dict[str, Any] = {}
         if mode in {"a", "w"}:
@@ -415,6 +417,8 @@ class HapStore:
                 del self._root[chrom_key]
             raise
         self._variant_index_cache.pop(chrom_key, None)
+        self._resolved_variant_alias_cache.pop(chrom_key, None)
+        self._missing_variant_alias_cache.pop(chrom_key, None)
         self._ambiguous_variant_alias_cache.pop(chrom_key, None)
 
     def delete_chromosome(self, chrom: str | int) -> None:
@@ -424,6 +428,8 @@ class HapStore:
             raise KeyError(f"chromosome {chrom_key!r} not found; cannot delete")
         del self._root[chrom_key]
         self._variant_index_cache.pop(chrom_key, None)
+        self._resolved_variant_alias_cache.pop(chrom_key, None)
+        self._missing_variant_alias_cache.pop(chrom_key, None)
         self._ambiguous_variant_alias_cache.pop(chrom_key, None)
 
     def haplotypes(
@@ -999,8 +1005,8 @@ class HapStore:
         backend: str = "auto",
         assume_no_missing: bool = False,
     ) -> HapStoreDosageBatch:
-        parsed = [self._normalize_dosage_request(chrom, request, i) for i, request in enumerate(requests)]
-        if not parsed:
+        request_specs = [self._parse_dosage_request(request, i) for i, request in enumerate(requests)]
+        if not request_specs:
             sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
             return HapStoreDosageBatch(
                 matrix=np.empty((sample_idx.size, 0), dtype=np.dtype(dtype)),
@@ -1009,6 +1015,23 @@ class HapStore:
                 request_ids=(),
                 metrics={"backend": "empty"},
             )
+        requested_ids = [
+            str(variant_id)
+            for _request_id, variant_ids, _variant_indices in request_specs
+            if variant_ids is not None
+            for variant_id in variant_ids
+        ]
+        if requested_ids:
+            self._resolve_variant_ids_chunked(chrom=chrom, variant_ids=requested_ids)
+        parsed: list[tuple[Hashable, np.ndarray, tuple[str, ...] | None]] = []
+        for request_id, variant_ids, variant_indices in request_specs:
+            indices = self._resolve_variant_indices(
+                chrom=chrom,
+                variant_ids=variant_ids,
+                variant_indices=variant_indices,
+            )
+            ids_tuple = tuple(str(value) for value in variant_ids) if variant_ids is not None else None
+            parsed.append((request_id, indices, ids_tuple))
         seen: set[int] = set()
         union_indices: list[int] = []
         for _request_id, indices, _ids in parsed:
@@ -1019,6 +1042,7 @@ class HapStore:
                 seen.add(idx_int)
                 union_indices.append(idx_int)
         union_indices = sorted(union_indices)
+        union_indices_arr = np.asarray(union_indices, dtype=np.int64)
         union_pos = {idx: i for i, idx in enumerate(union_indices)}
         request_columns = {
             request_id: np.asarray([union_pos[int(idx)] for idx in indices], dtype=np.int64)
@@ -1026,7 +1050,7 @@ class HapStore:
         }
         matrix = self.read_dosages(
             chrom,
-            variant_indices=np.asarray(union_indices, dtype=np.int64),
+            variant_indices=union_indices_arr,
             sample_indices=sample_indices,
             dtype=dtype,
             missing=missing,
@@ -1034,15 +1058,18 @@ class HapStore:
             backend=backend,
             assume_no_missing=assume_no_missing,
         )
-        info = self.variant_info(chrom)
+        metadata = self._read_variant_metadata_block(
+            chrom_group=self._require_chromosome(chrom),
+            variant_indices=union_indices_arr,
+        )
         chrom_alias = self._chrom_key(chrom).removeprefix("chr")
         union_variant_ids = tuple(
-            str(info["vid"][idx]) if str(info["vid"][idx]) else f"{chrom_alias}:{int(info['pos'][idx])}"
-            for idx in union_indices
+            str(vid) if str(vid) else f"{chrom_alias}:{int(pos)}"
+            for vid, pos in zip(metadata["vid"], metadata["positions"])
         )
         return HapStoreDosageBatch(
             matrix=matrix,
-            variant_indices=np.asarray(union_indices, dtype=np.int64),
+            variant_indices=union_indices_arr,
             request_columns=request_columns,
             request_ids=tuple(request_id for request_id, _indices, _ids in parsed),
             variant_ids=union_variant_ids,
@@ -1115,6 +1142,99 @@ class HapStore:
             self._ambiguous_variant_alias_cache[chrom_key] = ambiguous
         return self._variant_index_cache[chrom_key]
 
+    def _scan_variant_aliases(
+        self,
+        *,
+        chrom: str | int,
+        aliases: set[str],
+    ) -> tuple[dict[str, int], set[str]]:
+        """Scan variant metadata in storage chunks for only requested aliases."""
+        if not aliases:
+            return {}, set()
+        chrom_key = self._chrom_key(chrom)
+        chrom_alias = chrom_key.removeprefix("chr")
+        variants = self._require_chromosome(chrom)["variants"]
+        vid_array = variants["vid"]
+        pos_array = variants["pos"]
+        position_prefixes = (f"{chrom_alias}:", f"chr{chrom_alias}:")
+        need_positions = any(alias.startswith(position_prefixes) for alias in aliases)
+        chunk_size = int(vid_array.chunks[0])
+        if need_positions:
+            chunk_size = min(chunk_size, int(pos_array.chunks[0]))
+        found: dict[str, int] = {}
+        ambiguous: set[str] = set()
+
+        def add_alias(alias: str, index: int) -> None:
+            if alias not in aliases or alias in ambiguous:
+                return
+            previous = found.get(alias)
+            if previous is None or previous == int(index):
+                found[alias] = int(index)
+                return
+            found.pop(alias, None)
+            ambiguous.add(alias)
+
+        for start in range(0, int(vid_array.shape[0]), chunk_size):
+            stop = min(int(vid_array.shape[0]), start + chunk_size)
+            vids = _to_unicode_array(np.asarray(vid_array[start:stop], dtype=object))
+            positions = (
+                np.asarray(pos_array[start:stop], dtype=np.int64)
+                if need_positions
+                else None
+            )
+            for offset, vid in enumerate(vids):
+                index = int(start + offset)
+                text = str(vid).strip()
+                if text not in {"", "."}:
+                    add_alias(text, index)
+                if positions is not None:
+                    pos = int(positions[offset])
+                    add_alias(f"chr{chrom_alias}:{pos}", index)
+                    add_alias(f"{chrom_alias}:{pos}", index)
+        return found, ambiguous
+
+    def _resolve_variant_ids_chunked(
+        self,
+        *,
+        chrom: str | int,
+        variant_ids: Sequence[str],
+    ) -> np.ndarray:
+        """Resolve IDs with chunk-bounded scans and request-sized caches."""
+        requested = [str(variant_id) for variant_id in variant_ids]
+        if not requested:
+            return np.empty(0, dtype=np.int64)
+        chrom_key = self._chrom_key(chrom)
+        if chrom_key in self._variant_index_cache:
+            lookup = self._variant_index_cache[chrom_key]
+            ambiguous = self._ambiguous_variant_alias_cache.get(chrom_key, set())
+        else:
+            lookup = self._resolved_variant_alias_cache.setdefault(chrom_key, {})
+            ambiguous = self._ambiguous_variant_alias_cache.setdefault(chrom_key, set())
+            known_missing = self._missing_variant_alias_cache.setdefault(chrom_key, set())
+            unknown = set(requested) - set(lookup) - ambiguous - known_missing
+            if unknown:
+                found, newly_ambiguous = self._scan_variant_aliases(
+                    chrom=chrom,
+                    aliases=unknown,
+                )
+                lookup.update(found)
+                ambiguous.update(newly_ambiguous)
+                known_missing.update(unknown - set(found) - newly_ambiguous)
+
+        requested_ambiguous = [alias for alias in requested if alias in ambiguous]
+        if requested_ambiguous:
+            raise ValueError(
+                f"ambiguous variant alias on HapStore chromosome {chrom_key}: "
+                f"first={requested_ambiguous[0]!r}; use variant_indices instead"
+            )
+        missing = [variant_id for variant_id in requested if variant_id not in lookup]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} variant IDs missing from HapStore chromosome {chrom_key}; "
+                f"first={missing[:5]}"
+            )
+        return np.asarray([lookup[variant_id] for variant_id in requested], dtype=np.int64)
+
     def _resolve_variant_indices(
         self,
         *,
@@ -1125,23 +1245,7 @@ class HapStore:
         if (variant_ids is None) == (variant_indices is None):
             raise ValueError("pass exactly one of variant_ids or variant_indices")
         if variant_ids is not None:
-            lookup = self._variant_index_map(chrom)
-            chrom_key = self._chrom_key(chrom)
-            ambiguous = self._ambiguous_variant_alias_cache.get(chrom_key, set())
-            requested = [str(variant_id) for variant_id in variant_ids]
-            requested_ambiguous = [alias for alias in requested if alias in ambiguous]
-            if requested_ambiguous:
-                raise ValueError(
-                    f"ambiguous variant alias on HapStore chromosome {chrom_key}: "
-                    f"first={requested_ambiguous[0]!r}; use variant_indices instead"
-                )
-            missing = [variant_id for variant_id in requested if variant_id not in lookup]
-            if missing:
-                raise ValueError(
-                    f"{len(missing)} variant IDs missing from HapStore chromosome {self._chrom_key(chrom)}; "
-                    f"first={missing[:5]}"
-                )
-            arr = np.asarray([lookup[variant_id] for variant_id in requested], dtype=np.int64)
+            arr = self._resolve_variant_ids_chunked(chrom=chrom, variant_ids=variant_ids)
         else:
             arr = np.asarray(variant_indices, dtype=np.int64)
         if arr.ndim != 1:
@@ -1173,12 +1277,11 @@ class HapStore:
             raise IndexError(f"sample index out of bounds for n_samples={n_samples}")
         return out
 
-    def _normalize_dosage_request(
+    def _parse_dosage_request(
         self,
-        chrom: str | int,
         request: HapStoreDosageRequest | dict[str, Any] | tuple[Hashable, Sequence[str] | Sequence[int] | np.ndarray],
         fallback_index: int,
-    ) -> tuple[Hashable, np.ndarray, tuple[str, ...] | None]:
+    ) -> tuple[Hashable, Sequence[str] | None, Sequence[int] | np.ndarray | None]:
         if isinstance(request, HapStoreDosageRequest):
             request_id = request.request_id
             variant_ids = request.variant_ids
@@ -1198,13 +1301,7 @@ class HapStore:
                 variant_indices = variants
         else:
             raise TypeError(f"unsupported dosage request: {request!r}")
-        indices = self._resolve_variant_indices(
-            chrom=chrom,
-            variant_ids=variant_ids,
-            variant_indices=variant_indices,
-        )
-        ids_tuple = tuple(str(v) for v in variant_ids) if variant_ids is not None else None
-        return request_id, indices, ids_tuple
+        return request_id, variant_ids, variant_indices
 
     def _read_dosages_serial(
         self,
