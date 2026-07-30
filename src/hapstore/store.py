@@ -90,7 +90,47 @@ class _ReadGroup:
 
 
 class HapStore:
-    """High-level API over a chromosome-partitioned zarr haplotype store."""
+    """Open a chromosome-partitioned Zarr store of phased diploid haplotypes.
+
+    A HapStore contains one group per chromosome, normalized to keys such as
+    ``chr1``. Chromosome groups share one sample universe and ordering while
+    retaining chromosome-specific variant metadata, haplotypes, and optional
+    materialized genotypes.
+
+    Args:
+        path: Path to the HapStore Zarr hierarchy.
+        mode: Zarr open mode. ``"r"`` opens an existing store read-only,
+            ``"a"`` opens or creates a store for incremental writes, and
+            ``"w"`` creates or replaces a store. Write methods reject
+            read-only instances.
+
+    Attributes:
+        chromosomes: Sorted canonical chromosome group names present in the
+            store.
+        root: Underlying Zarr root group. Direct mutation is intended for
+            advanced use and bypasses HapStore validation.
+        path: Filesystem path used to open the store.
+        last_read_metrics: Copy of the planning and timing metrics recorded by
+            the most recent dosage or dosage-batch read on this instance.
+
+    Raises:
+        ValueError: If ``mode`` is not ``"r"``, ``"a"``, or ``"w"``.
+        FileNotFoundError: If ``mode="r"`` and ``path`` does not exist.
+
+    Notes:
+        Writable stores are initialized with root-level ``format="hapstore"``
+        and the current schema version when those attributes are absent.
+        Chromosome creation enforces identical sample identifiers and ordering
+        across chromosomes; read methods preserve requested sample and variant
+        order unless their individual contracts state otherwise.
+
+    Example:
+        >>> store = HapStore("panel.hapstore.zarr", mode="r")
+        >>> store.chromosomes
+        ['chr1', 'chr2']
+        >>> store.n_samples("1")
+        1000
+    """
 
     def __init__(self, path: str | Path, mode: str = "r") -> None:
         if mode not in {"r", "a", "w"}:
@@ -185,6 +225,73 @@ class HapStore:
         compression_level: int = 3,
         attrs: dict | None = None,
     ) -> None:
+        """Create and populate one chromosome group in the store.
+
+        Haplotypes must use the phased diploid layout ``(2N, V)``: rows
+        ``2*i`` and ``2*i + 1`` are the two haplotypes for sample ``i``, and
+        columns follow the order of the variant metadata arrays. Values are
+        restricted to reference allele ``0``, alternate allele ``1``, and the
+        fixed missing sentinel ``255``.
+
+        Args:
+            chrom: Chromosome label. It is normalized to the canonical
+                ``chrN`` group key, so labels such as ``1`` and ``chr1`` refer
+                to the same chromosome.
+            haplotypes: Phased allele matrix with shape ``(2N, V)``. The array
+                is stored as ``uint8`` without changing row or column order.
+            variant_pos: Positive integer base-pair coordinates with shape
+                ``(V,)``. Coordinates must be non-decreasing; duplicate
+                positions are allowed.
+            sample_ids: Non-empty, unique sample identifiers with shape
+                ``(N,)``. Every chromosome in one HapStore must use the same
+                sample identifiers in the same order.
+            ref: Reference alleles with shape ``(V,)``. Defaults to ``"."``
+                for every variant when omitted.
+            alt: Alternate alleles with shape ``(V,)``. Defaults to ``"."``
+                for every variant when omitted.
+            vid: Variant identifiers with shape ``(V,)``. Defaults to ``"."``
+                when omitted. Non-placeholder identifiers must be unique
+                within the chromosome.
+            genetic_positions: Optional genetic-map coordinates in
+                centimorgans with shape ``(V,)``. Values must be finite.
+            populations: Optional population label for each sample, with
+                shape ``(N,)``.
+            store_genotypes: Also materialize a dosage matrix with shape
+                ``(N, V)`` under ``genotypes``. Dosages are ``0``, ``1``, or
+                ``2``; a genotype is ``255`` when either haplotype is missing.
+            chunk_variant_size: Requested number of variant columns per Zarr
+                chunk. The stored value is capped at ``V``.
+            chunk_haplotype_size: Requested number of haplotype rows per
+                ``haplotypes`` chunk. When omitted, HapStore chooses a
+                byte-targeted, diploid-pair-aligned size.
+            chunk_sample_size: Requested number of sample rows per
+                ``genotypes`` chunk. It is relevant only when
+                ``store_genotypes`` is true; when omitted, HapStore chooses a
+                byte-targeted size.
+            compression_level: Non-negative Zstandard compression level used
+                for chromosome arrays.
+            attrs: Optional provenance metadata. ``source`` and ``build`` are
+                promoted to chromosome attributes; remaining entries are
+                stored under the ``extra`` attribute. Format, shape, missing,
+                compression, and chunk attributes are generated by HapStore.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If the store is read-only, the chromosome already
+                exists, array shapes or values violate the HapStore contract,
+                chunk/compression settings are invalid, or sample identity
+                differs from an existing chromosome.
+
+        Notes:
+            The method writes ``haplotypes``, optional ``genotypes``,
+            ``variants/{pos,ref,alt,vid}``, optional
+            ``variants/genetic_pos``, ``samples/ids``, and optional
+            ``samples/population``. If an exception occurs after chromosome
+            group creation, the partial chromosome group is deleted before
+            the exception is re-raised.
+        """
         self._require_write_mode()
 
         chrom_key = self._chrom_key(chrom)

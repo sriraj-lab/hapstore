@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hapstore"
-version = "0.4.0"
+version = "1.0.0"
 description = "Zarr-backed phased haplotype store with VCF/PGEN I/O"
 requires-python = ">=3.10"
 license = "MIT"
