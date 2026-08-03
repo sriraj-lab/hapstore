@@ -31,7 +31,11 @@ _AUTO_READ_TILE_MEMORY_FRACTION = 0.5
 
 @dataclass(frozen=True)
 class HapStoreDosageRequest:
-    """One named dosage request for a shared chromosome read."""
+    """One named variant selection for a shared chromosome dosage read.
+
+    Exactly one of ``variant_ids`` or ``variant_indices`` must be provided
+    when the request is passed to :meth:`HapStore.read_dosage_batch`.
+    """
 
     request_id: Hashable
     variant_ids: Sequence[str] | None = None
@@ -40,7 +44,13 @@ class HapStoreDosageRequest:
 
 @dataclass(frozen=True)
 class HapStoreDosageBatch:
-    """Shared union dosage matrix plus per-request column maps."""
+    """Shared union dosage matrix and mappings for individual requests.
+
+    ``matrix`` has shape ``(n_samples, n_union_variants)`` and follows the
+    sorted ``variant_indices`` order. Each entry in ``request_columns`` maps
+    the union matrix back to the original order, including duplicates, for one
+    request.
+    """
 
     matrix: np.ndarray
     variant_indices: np.ndarray
@@ -50,10 +60,12 @@ class HapStoreDosageBatch:
     metrics: dict[str, Any] | None = None
 
     def window_matrix(self, request_id: Hashable) -> np.ndarray:
+        """Return the dosage matrix for one request in its original order."""
         cols = self.request_columns[request_id]
         return np.asarray(self.matrix[:, cols], dtype=self.matrix.dtype)
 
     def project(self, request_id: Hashable, weights: np.ndarray) -> np.ndarray:
+        """Multiply one request's dosage matrix by a one-dimensional weight vector."""
         cols = self.request_columns[request_id]
         w = np.asarray(weights, dtype=self.matrix.dtype)
         if w.ndim != 1 or w.shape[0] != cols.shape[0]:
@@ -66,7 +78,13 @@ class HapStoreDosageBatch:
 
 @dataclass(frozen=True)
 class HapStoreBlock:
-    """One variant-axis block from a HapStore chromosome."""
+    """One variant-axis block with aligned values and variant metadata.
+
+    ``values`` has shape ``(n_samples, n_variants)`` for genotype blocks and
+    ``(2 * n_samples, n_variants)`` for haplotype blocks. ``start`` and
+    ``stop`` bound the selected variant indices but do not imply that every
+    intervening variant is present.
+    """
 
     values: np.ndarray
     variant_indices: np.ndarray
@@ -83,6 +101,8 @@ class HapStoreBlock:
 
 @dataclass(frozen=True)
 class _ReadGroup:
+    """One contiguous read group for a shared chromosome read."""
+
     start: int
     stop: int
     offsets: np.ndarray
@@ -156,18 +176,22 @@ class HapStore:
 
     @property
     def chromosomes(self) -> list[str]:
+        """Return chromosome group names in sorted order."""
         return sorted(list(self._root.group_keys()))
 
     @property
     def root(self) -> zarr.Group:
+        """Return the underlying Zarr root group."""
         return self._root
 
     @property
     def path(self) -> Path:
+        """Return the filesystem path to the store."""
         return self._path
 
     @property
     def last_read_metrics(self) -> dict[str, Any]:
+        """Return metrics from the most recent non-empty dosage read."""
         return dict(self._last_read_metrics)
 
     def _chrom_key(self, chrom: str | int) -> str:
@@ -544,6 +568,8 @@ class HapStore:
         self._ambiguous_variant_alias_cache.pop(chrom_key, None)
 
     def delete_chromosome(self, chrom: str | int) -> None:
+        """Permanently delete one chromosome group from a writable store."""
+
         self._require_write_mode()
         chrom_key = self._chrom_key(chrom)
         if chrom_key not in self._root:
@@ -560,6 +586,13 @@ class HapStore:
         variant_slice: slice | tuple[int, int] | None = None,
         sample_mask: np.ndarray | None = None,
     ) -> np.ndarray:
+        """Read phased haplotypes for one chromosome.
+
+        Returns a ``uint8`` array of shape ``(2 * N, V)``, where ``N`` is the
+        number of selected diploid samples and ``V`` is the number of selected
+        variants. A sample mask selects both haplotypes for each sample.
+        """
+
         chrom_group = self._require_chromosome(chrom)
         arr = chrom_group["haplotypes"]
 
@@ -592,6 +625,12 @@ class HapStore:
         variant_slice: slice | tuple[int, int] | None = None,
         sample_mask: np.ndarray | None = None,
     ) -> np.ndarray:
+        """Read diploid alternate-allele dosages for one chromosome.
+
+        Returns a ``uint8`` array of shape ``(N, V)``. Dosages are computed
+        from paired haplotypes when a materialized genotype dataset is absent.
+        """
+
         chrom_group = self._require_chromosome(chrom)
         variant_sel = _normalize_variant_slice(variant_slice, self.n_variants(chrom))
 
@@ -625,7 +664,13 @@ class HapStore:
         """Yield variant blocks in caller order with aligned metadata.
 
         Sparse explicit indices are read as chunk-local spans. Yielded blocks
-        still follow ``block_size`` and preserve duplicate indices.
+        still follow ``block_size`` and preserve duplicate indices. For sparse
+        blocks, ``start`` and ``stop`` are the minimum index and one past the
+        maximum index; only ``variant_indices`` are present in ``values``.
+
+        Genotype blocks have shape ``(N, V)`` and haplotype blocks have shape
+        ``(2 * N, V)``. Genotypes are computed from paired haplotypes when a
+        materialized genotype dataset is unavailable.
         """
         axis_name = str(axis).lower()
         if axis_name != "variants":
@@ -702,7 +747,20 @@ class HapStore:
         min_maf: float | None = None,
         include_metadata: bool = True,
     ) -> dict[str, Any]:
-        """Compute per-variant alternate-allele frequency and MAF."""
+        """Compute per-variant alternate-allele frequency and MAF.
+
+        MAF is the minimum of the alternate-allele frequency and its
+        complement. Missing genotypes are excluded from frequency denominators;
+        variants with no called genotypes receive NaN frequency and MAF.
+        ``called_genotype_count`` counts nonmissing diploid genotypes and
+        ``called_allele_count`` is twice that count.
+
+        The returned dictionary always contains variant indices, frequencies,
+        MAFs, alternate-allele counts, and called counts. When
+        ``include_metadata=True``, it also contains positions, alleles, IDs,
+        and genetic positions. ``min_maf`` filters the returned rows while
+        preserving their requested order.
+        """
         threshold = _normalize_min_maf(min_maf)
         chunks: dict[str, list[np.ndarray]] = {
             "variant_indices": [],
@@ -806,10 +864,37 @@ class HapStore:
         backend: str = "auto",
         assume_no_missing: bool = False,
     ) -> np.ndarray:
-        """Read dosages with chunk-aware threaded 2D tiling.
+        """Read diploid alternate-allele dosages for selected samples and variants.
 
-        Output columns follow the requested variant order. The serial path uses
-        one span for dense requests and chunk-local spans for sparse requests.
+        Exactly one of ``variant_ids`` or ``variant_indices`` must be provided.
+        Requested sample and variant order is preserved, including duplicate indices.
+
+        Args:
+            chrom: Chromosome label.
+            variant_ids: Variant identifiers to read.
+            variant_indices: Zero-based variant indices to read.
+            sample_indices: Zero-based sample indices or a boolean sample mask.
+                When omitted, all samples are read.
+            dtype: Output array data type. A floating type is required when
+                ``missing="nan"``.
+            missing: Represent missing genotypes as ``numpy.nan`` or retain the
+                HapStore sentinel value with ``"sentinel"``.
+            workers: Positive thread count or ``"auto"``. Setting this to ``1``
+                forces serial execution.
+            backend: Reading backend: ``"auto"``, ``"threaded"``, or ``"serial"``.
+            assume_no_missing: Skip missing-value checks for improved performance.
+                The caller must ensure that the selected data contain no missing
+                alleles.
+
+        Returns:
+            An array of shape ``(n_samples, n_variants)``. Dosages are read from
+            materialized genotypes when available and otherwise computed from paired
+            haplotypes.
+
+        Raises:
+            ValueError: If variant selection is ambiguous, an unsupported backend or
+                missing-value mode is requested, or the output dtype is incompatible
+                with ``missing="nan"``.
         """
         chrom_group = self._require_chromosome(chrom)
         variant_idx = self._resolve_variant_indices(
@@ -889,6 +974,8 @@ class HapStore:
         max_output_rows = max(int(group.out_positions.size) for group in sample_groups)
         max_output_cols = max(int(group.out_positions.size) for group in variant_groups)
         input_itemsize = np.dtype(arr.dtype).itemsize
+        # Bound worker selection using the largest tile's input, conversion,
+        # and output buffers.
         estimated_tile_bytes = int(
             max_input_rows * max_input_cols * input_itemsize
             + max_output_rows * max_output_cols * row_factor * input_itemsize
@@ -982,6 +1069,8 @@ class HapStore:
                 for sample_group in sample_groups
                 for variant_group in variant_groups
             )
+            # Read tiles concurrently and assign each completed tile into its
+            # disjoint output coordinates.
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hapstore-read") as pool:
                 pending = set()
                 for _ in range(max_in_flight_tiles):
@@ -1127,6 +1216,44 @@ class HapStore:
         backend: str = "auto",
         assume_no_missing: bool = False,
     ) -> HapStoreDosageBatch:
+        """Read multiple dosage requests in one call.
+
+        Each request supplies a hashable request ID and exactly one sequence of
+        variant IDs or zero-based variant indices. Requests may be represented
+        as ``HapStoreDosageRequest`` objects, mappings, or
+        ``(request_id, variants)`` tuples.
+
+        Variants resolving to the same stored index are read once into a sorted
+        union matrix. ``request_columns`` maps that matrix back to each
+        request's original variant order, including duplicates;
+        ``window_matrix()`` applies this mapping. Request IDs must be unique.
+
+        Args:
+            chrom: Chromosome label.
+            requests: A sequence of dosage requests.
+            sample_indices: Zero-based sample indices or a boolean sample mask.
+                When omitted, all samples are read.
+            dtype: Output array data type. A floating type is required when
+                ``missing="nan"``.
+            missing: Represent missing genotypes as ``numpy.nan`` or retain the
+                HapStore sentinel value with ``"sentinel"``.
+            workers: Positive thread count or ``"auto"``. Setting this to ``1``
+                forces serial execution.
+            backend: Reading backend: ``"auto"``, ``"threaded"``, or ``"serial"``.
+            assume_no_missing: Skip missing-value checks for improved performance.
+                The caller must ensure that the selected data contain no missing
+                alleles.
+        Returns:
+            A batch containing the union dosage matrix, sorted variant indices,
+            request-to-column mappings, resolved variant IDs, and read metrics.
+
+        Raises:
+            ValueError: If request IDs are duplicated, variant selection is
+                ambiguous, an unsupported backend or missing-value mode is
+                requested, or the output dtype is incompatible with
+                ``missing="nan"``.
+        """
+
         request_specs = [self._parse_dosage_request(request, i) for i, request in enumerate(requests)]
         if not request_specs:
             sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
@@ -1137,6 +1264,14 @@ class HapStore:
                 request_ids=(),
                 metrics={"backend": "empty"},
             )
+        seen_request_ids: set[Hashable] = set()
+        for request_id, _variant_ids, _variant_indices in request_specs:
+            try:
+                if request_id in seen_request_ids:
+                    raise ValueError(f"request IDs must be unique; duplicate={request_id!r}")
+                seen_request_ids.add(request_id)
+            except TypeError as exc:
+                raise TypeError(f"request ID must be hashable, got {request_id!r}") from exc
         requested_ids = [
             str(variant_id)
             for _request_id, variant_ids, _variant_indices in request_specs
@@ -1199,10 +1334,12 @@ class HapStore:
         )
 
     def variant_positions(self, chrom: str | int) -> np.ndarray:
+        """Return one-based physical positions in variant-row order."""
         chrom_group = self._require_chromosome(chrom)
         return np.asarray(chrom_group["variants"]["pos"][:], dtype=np.int64)
 
     def genetic_positions(self, chrom: str | int) -> np.ndarray | None:
+        """Return genetic positions in cM, or ``None`` when unavailable."""
         chrom_group = self._require_chromosome(chrom)
         variants = chrom_group["variants"]
         if "genetic_pos" not in variants:
@@ -1210,10 +1347,12 @@ class HapStore:
         return np.asarray(variants["genetic_pos"][:], dtype=np.float64)
 
     def sample_ids(self, chrom: str | int) -> list[str]:
+        """Return diploid sample IDs in stored row order."""
         chrom_group = self._require_chromosome(chrom)
         return _to_unicode_array(np.asarray(chrom_group["samples"]["ids"][:], dtype=object)).tolist()
 
     def variant_info(self, chrom: str | int) -> dict[str, Any]:
+        """Return physical positions, IDs, alleles, and optional genetic positions."""
         chrom_group = self._require_chromosome(chrom)
         variants = chrom_group["variants"]
         genetic = None
@@ -1229,7 +1368,7 @@ class HapStore:
         }
 
     def variant_index_map(self, chrom: str | int) -> dict[str, int]:
-        """Return variant ID/position aliases to variant-row indices."""
+        """Map unambiguous variant ID and chromosome-position aliases to rows."""
         return dict(self._variant_index_map(chrom))
 
     def _variant_index_map(self, chrom: str | int) -> dict[str, int]:
@@ -1364,6 +1503,8 @@ class HapStore:
         variant_ids: Sequence[str] | None,
         variant_indices: Sequence[int] | np.ndarray | None,
     ) -> np.ndarray:
+        """Resolve variant IDs or indices to a 1D array of variant indices."""
+
         if (variant_ids is None) == (variant_indices is None):
             raise ValueError("pass exactly one of variant_ids or variant_indices")
         if variant_ids is not None:
@@ -1435,6 +1576,12 @@ class HapStore:
         missing: str,
         assume_no_missing: bool,
     ) -> np.ndarray:
+        """Read and format dosages serially while preserving requested order.
+
+        ``assume_no_missing`` bypasses missing-value checks; callers using it
+        are responsible for ensuring that the selected data are complete.
+        """
+
         chrom_group = self._require_chromosome(chrom)
         dataset = "genotypes" if "genotypes" in chrom_group else "haplotypes"
         arr = chrom_group[dataset]
@@ -1487,22 +1634,27 @@ class HapStore:
         return out
 
     def n_samples(self, chrom: str | int) -> int:
+        """Return the number of diploid samples."""
         chrom_group = self._require_chromosome(chrom)
         return int(chrom_group.attrs["n_samples"])
 
     def n_variants(self, chrom: str | int) -> int:
+        """Return the number of variant rows."""
         chrom_group = self._require_chromosome(chrom)
         return int(chrom_group.attrs["n_variants"])
 
     def n_haplotypes(self, chrom: str | int) -> int:
+        """Return the number of phased haplotypes."""
         chrom_group = self._require_chromosome(chrom)
         return int(chrom_group.attrs["n_haplotypes"])
 
     def attrs(self, chrom: str | int) -> dict:
+        """Return a copy of the chromosome-group attributes."""
         chrom_group = self._require_chromosome(chrom)
         return dict(chrom_group.attrs.asdict())
 
     def has_chromosome(self, chrom: str | int) -> bool:
+        """Return whether the normalized chromosome group exists."""
         return self._chrom_key(chrom) in self._root
 
     def compute_windows(
@@ -1511,6 +1663,16 @@ class HapStore:
         window_size_cm: float,
         store: bool = False,
     ) -> np.ndarray:
+        """Compute non-overlapping genetic windows for one chromosome.
+
+        The chromosome must contain genetic positions in cM. The returned
+        ``(W, 2)`` integer array contains half-open ``[start, stop)`` variant
+        boundaries. When ``store=True``, boundaries and physical/genetic
+        midpoints are written under a namespace determined by
+        ``window_size_cm``. An existing namespace for that size is replaced,
+        and the HapStore must be writable.
+        """
+
         chrom_group = self._require_chromosome(chrom)
         genetic_pos = self.genetic_positions(chrom)
         if genetic_pos is None:
@@ -1572,6 +1734,15 @@ class HapStore:
         boundaries: np.ndarray | None = None,
         window_size_cm: float | None = None,
     ) -> Iterator[tuple[int, int, int, np.ndarray]]:
+        """Yield haplotypes for half-open variant windows.
+
+        Each item is ``(window_index, start, stop, haplotype_block)``, where
+        ``haplotype_block`` has shape ``(2 * N, stop - start)``. Explicit
+        ``boundaries`` take precedence. Otherwise, stored boundaries are used;
+        ``window_size_cm`` selects their namespace. If multiple namespaces
+        exist, a window size must be supplied.
+        """
+
         chrom_group = self._require_chromosome(chrom)
 
         if boundaries is None:
@@ -1803,6 +1974,11 @@ def _resolve_read_worker_count(
     estimated_tile_bytes: int | None = None,
     output_bytes: int = 0,
 ) -> tuple[int, dict[str, Any]]:
+    """Choose a worker count bounded by tasks, CPUs, and available memory.
+
+    Returns the selected count and a metrics dictionary recording the inputs,
+    limits, and source of the decision.
+    """
     available_cpus, cpu_source = _available_read_cpu_count()
     max_task_workers = max(1, min(int(n_tasks), int(available_cpus)))
     if estimated_tile_bytes is None:
@@ -1934,7 +2110,11 @@ def _available_read_cpu_count() -> tuple[int, str]:
 
 
 def _available_read_memory_bytes(cpu_count: int) -> tuple[int | None, str]:
-    """Return the most restrictive observable memory allowance in bytes."""
+    """Return the most restrictive observable memory allowance in bytes.
+
+    The selection strategy is inspired by ``dask.utils.get_memory_limit`` but
+    is limited to SLURM allocations, cgroup limits, and ``/proc/meminfo``.
+    """
     mib = 1024**2
     candidates: list[tuple[str, int]] = []
 
@@ -1989,6 +2169,7 @@ def _available_read_memory_bytes(cpu_count: int) -> tuple[int | None, str]:
 
 
 def _make_read_groups(indices: np.ndarray, *, chunk_size: int, limit: int) -> list[_ReadGroup]:
+    """Group requested indices by storage chunk while retaining output positions."""
     if int(chunk_size) <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
     pairs_by_chunk: dict[int, list[tuple[int, int]]] = {}
@@ -2077,6 +2258,7 @@ def _coalesce_read_groups(
     max_gap: int,
     min_density: float,
 ) -> list[_ReadGroup]:
+    """Merge nearby read groups without violating span, gap, or density limits."""
     if len(groups) <= 1:
         return groups
     if int(max_span) <= 0:

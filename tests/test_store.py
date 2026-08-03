@@ -729,6 +729,20 @@ def test_read_dosage_batch_window_matrix_and_project(tmp_path, synthetic_arrays,
     )
 
 
+def test_read_dosage_batch_rejects_duplicate_request_ids(tmp_path, synthetic_arrays):
+    store = HapStore(tmp_path / "duplicate_dosage_requests.zarr", mode="w")
+    store.create_chromosome(chrom="1", **synthetic_arrays)
+
+    with pytest.raises(ValueError, match="request IDs must be unique"):
+        store.read_dosage_batch(
+            "1",
+            [
+                HapStoreDosageRequest("duplicate", variant_ids=["v1"]),
+                HapStoreDosageRequest("duplicate", variant_ids=["v2"]),
+            ],
+        )
+
+
 def test_mode_enforcement_and_missing_chrom(tmp_path, synthetic_arrays):
     store_path = tmp_path / "mode.zarr"
     writer = HapStore(store_path, mode="w")

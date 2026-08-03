@@ -65,6 +65,7 @@ def _resolve_subset(
     all_samples: list[str],
     requested: list[str] | None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve requested sample IDs against a VCF header."""
     if requested is None:
         return np.arange(len(all_samples), dtype=np.int64), np.asarray(all_samples, dtype=object)
 
@@ -118,6 +119,33 @@ def _extract_vcf_arrays(
     on_missing_vid: MissingVidPolicy,
     on_unphased_gt: UnphasedPolicy,
 ) -> _IngestArrays:
+    """Extract one chromosome into the common in-memory ingestion representation.
+
+    All backends return ``_IngestArrays`` with haplotypes shaped
+    ``(2 * n_samples, n_variants)``. Samples retain the requested order, or VCF
+    header order when no subset is supplied. Variants retain backend iteration
+    order, alleles are encoded as ``0`` or ``1``, and missing alleles use
+    ``_MISSING_SENTINEL``. Missing metadata and unphased heterozygotes follow
+    the supplied policies.
+
+    Args:
+        vcf_path: Path to the VCF file.
+        chrom: Chromosome name or index to extract.
+        backend: Explicit reader backend, or ``"auto"`` to try cyvcf2, pysam,
+            and the pure-Python text reader in that order.
+        sample_ids: Optional sample subset in the desired output order.
+        on_missing_ref_alt: Policy for missing REF or ALT metadata.
+        on_missing_vid: Policy for missing variant IDs.
+        on_unphased_gt: Policy for unphased heterozygous genotypes.
+
+    Returns:
+        Aligned haplotypes, variant metadata, sample IDs, and diagnostic counts.
+
+    Raises:
+        ValueError: If the backend is unsupported or parsing and policy
+            validation fail. Auto mode retries all readers before raising.
+    """
+
     if backend == "auto":
         for candidate in ("cyvcf2", "pysam", "text"):
             try:
@@ -503,6 +531,7 @@ def _extract_vcf_arrays_text(
 
 
 def _parse_text_gt(gt_field: str, *, gt_index: int) -> tuple[int | None, int | None, bool] | None:
+    """Parse a VCF genotype field into alleles and phased status."""
     fields = gt_field.split(":")
     if int(gt_index) >= len(fields):
         return None

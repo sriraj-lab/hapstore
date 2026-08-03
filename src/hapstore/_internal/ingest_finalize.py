@@ -112,6 +112,36 @@ def _create_streaming_finalize_context(
     chunk_sample_size: int | None,
     compression_level: int,
 ) -> _StreamingFinalizeContext:
+    """Allocate provisional arrays for streaming one new chromosome.
+
+    The context owns aligned haplotype, optional genotype, and variant-metadata
+    arrays that are incrementally populated by ordered shard writes. Initial
+    variant capacity is estimated from the partition span and grows when
+    required.
+
+    Args:
+        output_zarr: Path to the output HapStore Zarr directory.
+        chrom: Chromosome name or number.
+        subset_ids: Sample IDs in output row order.
+        shard_specs: Ordered genomic ranges expected during finalization.
+        map_df: Optional genetic map used to allocate genetic positions.
+        store_genotypes: Whether to store genotypes in addition to haplotypes.
+        chunk_variant_size: Chunk size for the variant dimension.
+        chunk_haplotype_size: Chunk size for the haplotype dimension.
+        chunk_sample_size: Chunk size for the optional genotype sample dimension.
+        compression_level: Compression level for Zstd compression.
+
+    Returns:
+        The mutable context used by append, completion, and abort operations.
+
+    Raises:
+        ValueError: If shard ordering is invalid, the chromosome already
+            exists, or sample IDs differ from another chromosome in the store.
+
+    Notes:
+        Every created context must be passed to
+        ``_complete_streaming_finalize()`` or ``_abort_streaming_finalize()``.
+    """
     chrom_key = normalize_chrom(chrom, prefix=True)
     sample_ids_u = _to_unicode_array_safe(np.asarray(subset_ids, dtype=object))
     n_samples = int(sample_ids_u.shape[0])
@@ -302,7 +332,14 @@ def _stream_finalize_write_arrays(
     missing_vid_count: int = 0,
     unphased_gt_count: int = 0,
 ) -> None:
-    """Validate and append one in-memory variant block to a streaming store."""
+    """Validate and append one in-memory variant block to a streaming store.
+
+    The caller supplies blocks in genomic order. This function validates
+    aligned widths, nondecreasing positions within the block, and position
+    order across the preceding block boundary. It grows provisional arrays as
+    needed, writes at the current variant offset, accumulates diagnostics, and
+    advances that offset.
+    """
     h = np.asarray(haplotypes, dtype=np.uint8)
     positions = np.asarray(positions, dtype=np.int64)
     ref = np.asarray(ref, dtype=object)
@@ -370,6 +407,13 @@ def _complete_streaming_finalize(
     missing_sentinel: int,
     parallel_mode: str = "staged_materialize_finalize",
 ) -> HapStore:
+    """Commit a streamed chromosome after all expected shards are written.
+
+    Provisional arrays are trimmed to the number of variants actually written.
+    Chromosome attributes then record dimensions, chunk layout, missingness,
+    diagnostics, execution details, and caller-supplied provenance. Marking the
+    context finished prevents later rollback from deleting the committed group.
+    """
     final_variants = int(ctx.offset)
     ctx.hap_arr.resize((ctx.n_haplotypes, final_variants))
     if ctx.geno_arr is not None:
@@ -424,6 +468,7 @@ def _complete_streaming_finalize(
 
 
 def _abort_streaming_finalize(ctx: _StreamingFinalizeContext | None) -> None:
+    """Delete an uncommitted chromosome group after finalization fails."""
     if ctx is None or ctx.finished:
         return
     if ctx.chrom_key in ctx.store.root:

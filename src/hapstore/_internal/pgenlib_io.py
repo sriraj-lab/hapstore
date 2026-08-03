@@ -27,7 +27,17 @@ def ensure_pgenlib_available() -> None:
 
 
 class PgenlibWriter:
-    """Thin writer wrapper over pgenlib.PgenWriter."""
+    """Write phased, biallelic hardcalls to a PGEN payload.
+
+    This adapter writes only the ``.pgen`` file; ``hapstore.pgen`` owns the
+    aligned PVAR and PSAM files. The sample and variant counts are fixed when
+    the writer opens, and every appended batch is marked as phased.
+
+    Args:
+        pgen_path: Output path for the PGEN payload.
+        sample_ct: Number of diploid samples represented by every batch.
+        variant_ct: Total number of variants that will be appended.
+    """
 
     def __init__(self, pgen_path: str | Path, sample_ct: int, variant_ct: int) -> None:
         ensure_pgenlib_available()
@@ -47,7 +57,13 @@ class PgenlibWriter:
         )
 
     def append_alleles_batch(self, allele_batch: np.ndarray) -> None:
-        # pgenlib expects variant-major allele hardcalls shaped (variants, 2 * samples).
+        """Append variant-major, interleaved diploid allele hardcalls.
+
+        ``allele_batch`` must have shape ``(variants, 2 * samples)`` with each
+        sample's two alleles in adjacent columns. Alleles are encoded as
+        ``int32`` hardcalls, with ``-9`` representing missing alleles. Input is
+        converted to C-contiguous ``int32`` storage when necessary.
+        """
         arr = np.asarray(allele_batch)
         if arr.ndim != 2:
             raise ValueError(f"allele_batch must be 2D, got shape={arr.shape}")
@@ -79,7 +95,17 @@ class PgenlibWriter:
 
 
 class PgenlibReader:
-    """Thin reader wrapper over pgenlib.PgenReader/PvarReader."""
+    """Read PGEN hardcalls together with aligned PVAR metadata.
+
+    The optional sample subset is passed to pgenlib and controls the sample
+    axis returned by hardcall reads. ``hapstore.pgen`` supplies a sorted subset
+    and separately restores any caller-requested sample order.
+
+    Args:
+        pgen_path: Input PGEN payload.
+        pvar_path: Aligned PVAR variant metadata.
+        sample_subset: Optional zero-based source-sample indices to read.
+    """
 
     def __init__(
         self,
@@ -126,16 +152,57 @@ class PgenlibReader:
         allele_buf: np.ndarray,
         phasepresent_buf: np.ndarray,
     ) -> None:
-        alleles = np.asarray(allele_buf, dtype=np.int32)
-        phase = np.asarray(phasepresent_buf, dtype=np.uint8)
+        """Fill caller-owned buffers for a half-open variant range.
+
+        ``allele_buf`` must be writable, C-contiguous ``int32`` with shape
+        ``(end - start, 2 * sample_ct)``. ``phasepresent_buf`` must be writable,
+        C-contiguous ``uint8`` with shape ``(end - start, sample_ct)``. Requiring
+        exact dtypes prevents NumPy from creating temporary output arrays that
+        would not update the caller's buffers.
+        """
+        start_i = int(start)
+        end_i = int(end)
+        if start_i < 0 or end_i <= start_i or end_i > self.variant_ct:
+            raise ValueError(
+                "invalid PGEN variant range: "
+                f"[{start_i}, {end_i}) for variant_ct={self.variant_ct}"
+            )
+
+        alleles = np.asarray(allele_buf)
+        phase = np.asarray(phasepresent_buf)
+        if alleles.dtype != np.dtype(np.int32):
+            raise ValueError(f"allele_buf must have dtype int32, got {alleles.dtype}")
+        if phase.dtype != np.dtype(np.uint8):
+            raise ValueError(
+                f"phasepresent_buf must have dtype uint8, got {phase.dtype}"
+            )
+
+        width = int(end_i - start_i)
+        expected_allele_shape = (width, 2 * self.sample_ct)
+        expected_phase_shape = (width, self.sample_ct)
+        if alleles.shape != expected_allele_shape:
+            raise ValueError(
+                "allele_buf shape mismatch: "
+                f"expected {expected_allele_shape}, got {alleles.shape}"
+            )
+        if phase.shape != expected_phase_shape:
+            raise ValueError(
+                "phasepresent_buf shape mismatch: "
+                f"expected {expected_phase_shape}, got {phase.shape}"
+            )
         if not alleles.flags["C_CONTIGUOUS"]:
             raise ValueError("allele_buf must be C-contiguous")
         if not phase.flags["C_CONTIGUOUS"]:
             raise ValueError("phasepresent_buf must be C-contiguous")
+        if not alleles.flags["WRITEABLE"]:
+            raise ValueError("allele_buf must be writable")
+        if not phase.flags["WRITEABLE"]:
+            raise ValueError("phasepresent_buf must be writable")
+
         # hap_maj=False requests the same variant-major layout used by export.
         self._reader.read_alleles_and_phasepresent_range(
-            int(start),
-            int(end),
+            start_i,
+            end_i,
             alleles,
             phase,
             hap_maj=False,

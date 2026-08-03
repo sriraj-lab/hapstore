@@ -14,6 +14,7 @@ def _has_tabix_index(vcf_path: Path) -> bool:
 
 
 def _resolve_contig_span_end_from_tabix_index(vcf_path: Path, contig: str) -> int | None:
+    """Best-effort estimate of a contig's exclusive end from a tabix index."""
     tbi = Path(f"{vcf_path}.tbi")
     if tbi.exists():
         end = _contig_span_end_from_tbi(tbi, contig)

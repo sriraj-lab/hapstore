@@ -1,7 +1,15 @@
-"""Direct HapStore <-> PGEN I/O helpers (biallelic, phased).
+"""Direct conversion between HapStore and phased, biallelic PGEN data.
 
-This module owns the public conversion behavior. Low-level pgenlib buffer
-handling is isolated in hapstore._internal.pgenlib_io.
+Serial export streams HapStore variant blocks into one PGEN triplet. Parallel
+export divides the selected variant axis into independent PGEN shards and uses
+PLINK2 to merge those shards in genomic order. Serial ingestion streams PGEN
+blocks directly into a HapStore, while parallel ingestion writes contiguous
+variant ranges to temporary HapStores and concatenates them along the variant
+axis.
+
+This module owns conversion policy, sample and variant selection, missingness
+handling, and serial/parallel orchestration. Low-level pgenlib buffer handling
+is isolated in ``hapstore._internal.pgenlib_io``.
 """
 
 from __future__ import annotations
@@ -21,7 +29,6 @@ import numpy as np
 from hapstore.chrom import normalize_chrom
 from hapstore.ids import read_sample_ids
 
-from ._internal.chrom_attrs import build_chrom_attrs
 from ._internal.chunking import DEFAULT_VARIANT_CHUNK_SIZE
 from ._internal.export_selection import (
     _iter_variant_slices,
@@ -57,7 +64,20 @@ def _read_pgen_haplotype_block(
     strict_biallelic: bool,
     on_unphased_gt: UnphasedPolicy,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-    """Read one PGEN variant block into HapStore's haplotype-major representation."""
+    """Read one PGEN block into HapStore's haplotype-major representation.
+
+    PGEN returns a variant-major matrix with each sample's two alleles in
+    adjacent columns. This function converts it to the HapStore layout of
+    ``(2 * samples, variants)``. Missing diploid pairs are encoded with
+    ``_MISSING_SENTINEL``. Unphased heterozygotes either raise or become
+    missing on both haplotypes; unphased homozygotes remain unambiguous.
+    ``hap_reorder`` restores the caller's requested sample order after pgenlib
+    reads a sorted sample subset.
+
+    Returns:
+        Haplotype data, positions, REF alleles, ALT alleles, variant IDs, and
+        the number of unphased heterozygous genotypes encountered.
+    """
     width = int(end - start)
     positions = np.empty(width, dtype=np.int64)
     refs = np.empty(width, dtype=object)
@@ -156,7 +176,13 @@ def _stream_pgen_range_to_store(
     store_genotypes: bool,
     attrs: dict | None,
 ) -> HapStore:
-    """Stream a bounded PGEN variant range directly into an ordered store."""
+    """Stream a bounded PGEN variant range into a new HapStore chromosome.
+
+    The range is read in ordered blocks and appended through the shared
+    streaming-finalization machinery. Successful completion trims provisional
+    arrays and commits chromosome metadata. A failed write aborts the partial
+    chromosome and removes a newly created output path.
+    """
     if int(start_variant) < 0 or int(end_variant) <= int(start_variant):
         raise ValueError(f"invalid PGEN variant range [{start_variant}, {end_variant})")
     output_path = Path(output_zarr)
@@ -276,6 +302,47 @@ def export_pgen(
     """Export one chromosome from HapStore directly to PGEN triplet.
 
     Current scope is diploid, phased, biallelic hardcalls only.
+
+    Args:
+        store_path: Path to HapStore root.
+        out_prefix: Output prefix for PGEN triplet (pgen/pvar/psam).
+        chrom: Chromosome key to export (normalized with prefix).
+        sample_ids: Optional sample subset in the desired output order. All
+            samples are exported when omitted.
+        variant_ids: Optional variant-ID or position-based subset. Mutually
+            exclusive with ``variant_indices``.
+        variant_indices: Optional zero-based variant-index subset. Indices are
+            deduplicated and exported in store order. Mutually exclusive with
+            ``variant_ids``.
+        min_maf: Optional minimum minor allele frequency calculated within the
+            selected output samples.
+        filter_monomorphic: Remove variants with zero minor allele frequency
+            within the selected output samples.
+        variant_block_size: Number of variants per read/write block.
+        strict_biallelic: Must remain True; non-biallelic export is unsupported.
+        on_partial_missing: Handling for a diploid genotype with one missing
+            allele. ``"error"`` rejects it and ``"missing"`` marks both
+            alleles missing.
+        n_workers: Number of variant-shard export workers. Values greater than
+            one require PLINK2 for the final merge.
+        plink2_workers: Number of PLINK2 threads used to merge parallel shards.
+        plink2_path: PLINK2 executable used to merge parallel shards.
+        shard_tmp_dir: Optional directory for parallel-export shard triplets.
+        keep_intermediate_shards: Retain parallel-export shard files instead
+            of cleaning them after the export attempt.
+
+    Returns:
+        Path to the output PGEN triplet prefix.
+
+    Raises:
+        ValueError: If selection, missingness, or biallelic validation fails.
+        RuntimeError: If writing or merging does not produce a valid triplet.
+
+    Notes:
+        Variant subsets retain HapStore order. Parallel export writes
+        independent variant shards and combines them with PLINK2. Public export
+        validation removes the entire output triplet after any failure so a
+        partial result cannot be mistaken for a complete export.
     """
     if not strict_biallelic:
         raise ValueError("HapStore PGEN export supports biallelic hardcalls only; strict_biallelic=False is unsupported")
@@ -359,6 +426,7 @@ def export_pgen(
             shard_prefixes.append(shard_prefix)
 
         mp_context = mp.get_context("spawn")
+        # Each worker writes one variant shard; PLINK2 combines them below.
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=min(int(n_workers), len(shard_prefixes)),
             mp_context=mp_context,
@@ -435,6 +503,13 @@ def _export_pgen_single(
     strict_biallelic: bool = True,
     on_partial_missing: PartialMissingPolicy = "error",
 ) -> Path:
+    """Stream one HapStore chromosome or subset into a PGEN triplet.
+
+    Sample order follows the caller's request and variant order follows the
+    HapStore. Haplotype blocks are transposed into PGEN's variant-major,
+    interleaved-allele representation. PVAR and PSAM metadata are written in
+    the same order as the PGEN payload.
+    """
     ensure_pgenlib_available()
     if int(variant_block_size) <= 0:
         raise ValueError(f"variant_block_size must be positive, got {variant_block_size}")
@@ -602,6 +677,42 @@ def ingest_pgen(
     """Ingest one chromosome from PGEN triplet into HapStore.
 
     Current scope is diploid, phased, biallelic hardcalls only.
+
+    Args:
+        pgen_prefix: Input prefix for PGEN triplet (pgen/pvar/psam).
+        output_zarr: Output path for HapStore root.
+        chrom: Chromosome key to ingest (normalized with prefix).
+        sample_ids: Optional sample subset in the desired HapStore order. All
+            samples are ingested when omitted.
+        variant_block_size: Number of variants per read/write block.
+        on_unphased_gt: Handling for unphased heterozygous genotypes.
+            ``"error"`` rejects them and ``"missing"`` marks both haplotypes
+            missing. Unphased homozygotes are retained.
+        strict_biallelic: Must remain True; non-biallelic ingestion is
+            unsupported.
+        workers: Number of contiguous variant-range workers.
+        chunk_variant_size: Chunk size for variants in the output store.
+        chunk_haplotype_size: Chunk size for haplotypes in the output store.
+        chunk_sample_size: Chunk size for samples in the output store.
+        compression_level: Non-negative Zstandard compression level.
+        store_genotypes: If True, store genotypes in addition to haplotypes.
+        attrs: Optional chromosome attributes to add to the HapStore.
+        scratch_dir: Optional directory for temporary parallel-ingestion
+            HapStores.
+        cleanup_intermediates: Remove temporary parallel-ingestion HapStores
+            after completion or failure.
+
+    Returns:
+        HapStore object representing the ingested data.
+
+    Raises:
+        ValueError: If sample, chromosome, phasing, or biallelic validation
+            fails.
+
+    Notes:
+        Serial ingestion streams blocks directly into the destination.
+        Parallel ingestion creates one temporary HapStore per contiguous
+        variant range and concatenates those stores along the variant axis.
     """
     if not strict_biallelic:
         raise ValueError("HapStore PGEN ingest supports biallelic hardcalls only; strict_biallelic=False is unsupported")
@@ -689,6 +800,12 @@ def _resolve_pgen_ingest_sample_subset(
     selected_sample_ids: list[str],
     sample_mask: np.ndarray | None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Build pgenlib's sorted subset and a HapStore-order permutation.
+
+    pgenlib requires sample indices in increasing source order. HapStore allows
+    callers to request any sample order, so ``hap_reorder`` maps the interleaved
+    haplotypes returned for that sorted subset back to the requested order.
+    """
     if sample_mask is None:
         return None, None
 
@@ -709,6 +826,7 @@ def _scan_pgen_metadata(
     chrom_key: str,
     strict_biallelic: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Preflight PGEN variant metadata before parallel ingestion."""
     positions: list[int] = []
     refs: list[str] = []
     alts: list[str] = []
@@ -792,6 +910,7 @@ def _ingest_pgen_variant_range_to_store(
     compression_level: int,
     store_genotypes: bool,
 ) -> tuple[str, int]:
+    """Worker adapter that materializes one variant range as a HapStore."""
     out = _stream_pgen_range_to_store(
         pgen_path=Path(pgen_path),
         pvar_path=Path(pvar_path),
@@ -812,52 +931,8 @@ def _ingest_pgen_variant_range_to_store(
         store_genotypes=bool(store_genotypes),
         attrs={"source": "pgen"},
     )
-    return str(Path(output_zarr)), int(out.attrs(chrom_key).get("extra", {}).get("unphased_gt_count", 0))
-
-
-def _restore_parallel_pgen_attrs(
-    *,
-    store: HapStore,
-    chrom_key: str,
-    attrs_payload: dict[str, object],
-    chunk_variant_size: int,
-    chunk_haplotype_size: int | None,
-    chunk_sample_size: int | None,
-    compression_level: int,
-) -> None:
-    chrom_group = store.root[chrom_key]
-    n_samples = int(chrom_group.attrs["n_samples"])
-    n_haplotypes = int(chrom_group.attrs["n_haplotypes"])
-    n_variants = int(chrom_group.attrs["n_variants"])
-    has_missing = bool(chrom_group.attrs["has_missing"])
-    layout_version = int(chrom_group.attrs["layout_version"])
-    extra_payload = dict(attrs_payload)
-    source = extra_payload.pop("source", None)
-    build = extra_payload.pop("build", None)
-    haplotype_chunks = chrom_group["haplotypes"].chunks
-    actual_variant_chunk = int(haplotype_chunks[1])
-    actual_haplotype_chunk = int(haplotype_chunks[0])
-    actual_sample_chunk = (
-        int(chrom_group["genotypes"].chunks[0])
-        if "genotypes" in chrom_group
-        else None
-    )
-    chrom_group.attrs.update(
-        build_chrom_attrs(
-            n_samples=n_samples,
-            n_haplotypes=n_haplotypes,
-            n_variants=n_variants,
-            missing_sentinel=int(_MISSING_SENTINEL),
-            has_missing=has_missing,
-            compression_level=int(compression_level),
-            chunk_variant_size=actual_variant_chunk,
-            chunk_haplotype_size=actual_haplotype_chunk,
-            chunk_sample_size=actual_sample_chunk,
-            layout_version=int(layout_version),
-            source=source,
-            build=build,
-            extra=extra_payload or None,
-        )
+    return str(Path(output_zarr)), int(
+        out.attrs(chrom_key).get("extra", {}).get("unphased_gt_count", 0)
     )
 
 
@@ -883,6 +958,14 @@ def _ingest_pgen_parallel(
     scratch_dir: str | Path | None,
     cleanup_intermediates: bool,
 ) -> HapStore:
+    """Ingest contiguous PGEN ranges in parallel and concatenate the results.
+
+    Metadata is preflighted once before workers launch. Each worker streams a
+    disjoint, contiguous variant range into a temporary HapStore while using
+    the same selected samples and sample order. The completed stores are then
+    concatenated serially along the variant axis, and per-shard unphased-
+    genotype counts are summed into the final chromosome metadata.
+    """
     positions, _ref, _alt, _vid = _scan_pgen_metadata(
         pgen_path=pgen_path,
         pvar_path=pvar_path,
@@ -1037,6 +1120,13 @@ def _resolve_export_variant_indices(
     n_variants: int,
     scan_block_size: int,
 ) -> list[int] | None:
+    """Resolve a store-ordered variant subset and apply sample-specific MAF.
+
+    Explicit indices are deduplicated and sorted. Variant IDs and position-
+    based identifiers are resolved against chromosome metadata. When a MAF
+    threshold is active, frequencies are calculated after applying the output
+    sample subset.
+    """
     threshold = _resolve_export_min_maf(min_maf=min_maf, filter_monomorphic=filter_monomorphic)
     if variant_indices is not None:
         selected = sorted(set(int(i) for i in variant_indices))
@@ -1127,6 +1217,7 @@ def _merge_pgen_shards_with_plink(
     plink2_bin: str,
     threads: int,
 ) -> None:
+    """Merge ordered variant-shard triplets while preserving sample order."""
     if not shard_prefixes:
         raise ValueError("shard_prefixes must be non-empty")
     if int(threads) <= 0:
@@ -1199,6 +1290,7 @@ def _handle_partial_missing_pairs(
     chrom_key: str,
     positions: np.ndarray,
 ) -> None:
+    """Reject one-missing-allele genotypes or make both alleles missing."""
     a0 = allele_batch[:, 0::2]
     a1 = allele_batch[:, 1::2]
     partial = (a0 == -9) ^ (a1 == -9)

@@ -1,4 +1,13 @@
-"""Shard range and contig span planning for hapstore parallel ingest."""
+"""Resolve contigs and genomic shard ranges for parallel VCF ingestion.
+
+This module resolves chromosome aliases against indexed VCF records, determines
+the usable contig span from header metadata, TBI/CSI indexes, or record
+scanning, and splits that span into deterministic zero-based, half-open shard
+intervals.
+
+When no reliable span can be determined, a single shard with unspecified bounds
+is returned so the backend can read the complete contig.
+"""
 
 from __future__ import annotations
 
