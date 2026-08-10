@@ -1,4 +1,4 @@
-"""Tabix/CSI index parsing for hapstore ingest."""
+"""Parse Tabix and CSI indexes for HapStore ingestion."""
 
 from __future__ import annotations
 

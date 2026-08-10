@@ -1,11 +1,11 @@
 """Direct conversion between HapStore and phased, biallelic PGEN data.
 
-Serial export streams HapStore variant blocks into one PGEN triplet. Parallel
-export divides the selected variant axis into independent PGEN shards and uses
-PLINK2 to merge those shards in genomic order. Serial ingestion streams PGEN
-blocks directly into a HapStore, while parallel ingestion writes contiguous
-variant ranges to temporary HapStores and concatenates them along the variant
-axis.
+Serial export streams HapStore variant blocks into one PGEN/PVAR/PSAM triplet.
+Parallel export divides the selected variant axis into independent PGEN shards
+and uses PLINK2 to merge those shards in genomic order. Serial ingestion
+streams PGEN blocks directly into a HapStore, while parallel ingestion writes
+contiguous variant ranges to temporary HapStores and concatenates them along
+the variant axis.
 
 This module owns conversion policy, sample and variant selection, missingness
 handling, and serial/parallel orchestration. Low-level pgenlib buffer handling
@@ -299,14 +299,15 @@ def export_pgen(
     shard_tmp_dir: str | Path | None = None,
     keep_intermediate_shards: bool = False,
 ) -> Path:
-    """Export one chromosome from HapStore directly to PGEN triplet.
+    """Export one HapStore chromosome to a PGEN/PVAR/PSAM triplet.
 
     Current scope is diploid, phased, biallelic hardcalls only.
 
     Args:
-        store_path: Path to HapStore root.
-        out_prefix: Output prefix for PGEN triplet (pgen/pvar/psam).
-        chrom: Chromosome key to export (normalized with prefix).
+        store_path: Path to the HapStore Zarr hierarchy.
+        out_prefix: Output prefix for the ``.pgen``, ``.pvar``, and ``.psam``
+            files.
+        chrom: Chromosome to export. The key is normalized to ``chrN`` form.
         sample_ids: Optional sample subset in the desired output order. All
             samples are exported when omitted.
         variant_ids: Optional variant-ID or position-based subset. Mutually
@@ -319,7 +320,8 @@ def export_pgen(
         filter_monomorphic: Remove variants with zero minor allele frequency
             within the selected output samples.
         variant_block_size: Number of variants per read/write block.
-        strict_biallelic: Must remain True; non-biallelic export is unsupported.
+        strict_biallelic: Must remain ``True``; non-biallelic export is
+            unsupported.
         on_partial_missing: Handling for a diploid genotype with one missing
             allele. ``"error"`` rejects it and ``"missing"`` marks both
             alleles missing.
@@ -332,7 +334,7 @@ def export_pgen(
             of cleaning them after the export attempt.
 
     Returns:
-        Path to the output PGEN triplet prefix.
+        Path to the completed PGEN/PVAR/PSAM triplet prefix.
 
     Raises:
         ValueError: If selection, missingness, or biallelic validation fails.
@@ -503,7 +505,7 @@ def _export_pgen_single(
     strict_biallelic: bool = True,
     on_partial_missing: PartialMissingPolicy = "error",
 ) -> Path:
-    """Stream one HapStore chromosome or subset into a PGEN triplet.
+    """Stream one HapStore chromosome or subset into a PGEN/PVAR/PSAM triplet.
 
     Sample order follows the caller's request and variant order follows the
     HapStore. Haplotype blocks are transposed into PGEN's variant-major,
@@ -674,36 +676,37 @@ def ingest_pgen(
     scratch_dir: str | Path | None = None,
     cleanup_intermediates: bool = True,
 ) -> HapStore:
-    """Ingest one chromosome from PGEN triplet into HapStore.
+    """Ingest one chromosome from a PGEN/PVAR/PSAM triplet into HapStore.
 
     Current scope is diploid, phased, biallelic hardcalls only.
 
     Args:
-        pgen_prefix: Input prefix for PGEN triplet (pgen/pvar/psam).
-        output_zarr: Output path for HapStore root.
-        chrom: Chromosome key to ingest (normalized with prefix).
+        pgen_prefix: Input prefix for the ``.pgen``, ``.pvar``, and ``.psam``
+            files.
+        output_zarr: Path to the HapStore Zarr hierarchy to create or append to.
+        chrom: Chromosome to ingest. The key is normalized to ``chrN`` form.
         sample_ids: Optional sample subset in the desired HapStore order. All
             samples are ingested when omitted.
         variant_block_size: Number of variants per read/write block.
         on_unphased_gt: Handling for unphased heterozygous genotypes.
             ``"error"`` rejects them and ``"missing"`` marks both haplotypes
             missing. Unphased homozygotes are retained.
-        strict_biallelic: Must remain True; non-biallelic ingestion is
+        strict_biallelic: Must remain ``True``; non-biallelic ingestion is
             unsupported.
         workers: Number of contiguous variant-range workers.
         chunk_variant_size: Chunk size for variants in the output store.
         chunk_haplotype_size: Chunk size for haplotypes in the output store.
         chunk_sample_size: Chunk size for samples in the output store.
         compression_level: Non-negative Zstandard compression level.
-        store_genotypes: If True, store genotypes in addition to haplotypes.
-        attrs: Optional chromosome attributes to add to the HapStore.
+        store_genotypes: Also materialize diploid genotype dosages.
+        attrs: Optional caller-supplied chromosome provenance metadata.
         scratch_dir: Optional directory for temporary parallel-ingestion
             HapStores.
         cleanup_intermediates: Remove temporary parallel-ingestion HapStores
             after completion or failure.
 
     Returns:
-        HapStore object representing the ingested data.
+        The completed HapStore opened at ``output_zarr``.
 
     Raises:
         ValueError: If sample, chromosome, phasing, or biallelic validation

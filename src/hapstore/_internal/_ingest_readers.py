@@ -1,4 +1,9 @@
-"""VCF reader backends for hapstore ingest."""
+"""Read VCF records into the shared HapStore ingestion representation.
+
+The cyvcf2, pysam, and text backends normalize sample order, phased allele
+encoding, missingness, and variant metadata into the same ``_IngestArrays``
+contract before orchestration writes a HapStore.
+"""
 
 from __future__ import annotations
 

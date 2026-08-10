@@ -1,7 +1,7 @@
-"""Private adapter layer for pgenlib read/write operations.
+"""Adapt pgenlib read/write operations for HapStore conversion.
 
 This module intentionally provides a small compatibility surface used by
-`hapstore.pgen`.
+``hapstore.pgen``.
 """
 
 from __future__ import annotations

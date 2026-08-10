@@ -1,4 +1,4 @@
-"""Zarr-backed haplotype/genotype store."""
+"""Store and read chromosome-partitioned phased haplotypes in Zarr."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class HapStoreDosageRequest:
     """One named variant selection for a shared chromosome dosage read.
 
     Exactly one of ``variant_ids`` or ``variant_indices`` must be provided
-    when the request is passed to :meth:`HapStore.read_dosage_batch`.
+    when the request is passed to ``HapStore.read_dosage_batch()``.
     """
 
     request_id: Hashable
@@ -144,7 +144,7 @@ class HapStore:
         across chromosomes; read methods preserve requested sample and variant
         order unless their individual contracts state otherwise.
 
-    Example:
+    Examples:
         >>> store = HapStore("panel.hapstore.zarr", mode="r")
         >>> store.chromosomes
         ['chr1', 'chr2']
@@ -867,7 +867,8 @@ class HapStore:
         """Read diploid alternate-allele dosages for selected samples and variants.
 
         Exactly one of ``variant_ids`` or ``variant_indices`` must be provided.
-        Requested sample and variant order is preserved, including duplicate indices.
+        Requested sample and variant order is preserved, including duplicate
+        indices.
 
         Args:
             chrom: Chromosome label.
@@ -877,7 +878,7 @@ class HapStore:
                 When omitted, all samples are read.
             dtype: Output array data type. A floating type is required when
                 ``missing="nan"``.
-            missing: Represent missing genotypes as ``numpy.nan`` or retain the
+            missing: Represent missing genotypes as ``np.nan`` or retain the
                 HapStore sentinel value with ``"sentinel"``.
             workers: Positive thread count or ``"auto"``. Setting this to ``1``
                 forces serial execution.
@@ -1235,7 +1236,7 @@ class HapStore:
                 When omitted, all samples are read.
             dtype: Output array data type. A floating type is required when
                 ``missing="nan"``.
-            missing: Represent missing genotypes as ``numpy.nan`` or retain the
+            missing: Represent missing genotypes as ``np.nan`` or retain the
                 HapStore sentinel value with ``"sentinel"``.
             workers: Positive thread count or ``"auto"``. Setting this to ``1``
                 forces serial execution.
@@ -1243,6 +1244,7 @@ class HapStore:
             assume_no_missing: Skip missing-value checks for improved performance.
                 The caller must ensure that the selected data contain no missing
                 alleles.
+
         Returns:
             A batch containing the union dosage matrix, sorted variant indices,
             request-to-column mappings, resolved variant IDs, and read metrics.

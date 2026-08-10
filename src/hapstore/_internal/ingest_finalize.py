@@ -1,4 +1,9 @@
-"""Streaming ingest finalization helpers."""
+"""Finalize ordered ingestion shards into one HapStore chromosome.
+
+Finalization allocates provisional arrays, grows them as ordered shards arrive,
+trims them to the committed variant count, writes chromosome metadata, and
+removes the uncommitted chromosome group if the pipeline fails.
+"""
 
 from __future__ import annotations
 
@@ -129,7 +134,7 @@ def _create_streaming_finalize_context(
         chunk_variant_size: Chunk size for the variant dimension.
         chunk_haplotype_size: Chunk size for the haplotype dimension.
         chunk_sample_size: Chunk size for the optional genotype sample dimension.
-        compression_level: Compression level for Zstd compression.
+        compression_level: Non-negative Zstandard compression level.
 
     Returns:
         The mutable context used by append, completion, and abort operations.

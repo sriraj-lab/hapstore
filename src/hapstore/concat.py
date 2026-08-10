@@ -1,4 +1,10 @@
-"""HapStore concatenation utilities."""
+"""Concatenate HapStores along their sample or variant axis.
+
+Concatenation stacks already aligned stores in input order; it does not join,
+sort, or harmonize records by sample or variant key. The module validates the
+axis that must remain fixed, builds the result in a temporary store, and only
+promotes that store to the requested output path after successful completion.
+"""
 
 from __future__ import annotations
 
@@ -33,6 +39,8 @@ from .store import HapStore, _MISSING_SENTINEL
 
 @dataclass
 class _InputChrom:
+    """Validated chromosome state cached for one input store."""
+
     path: Path
     store: HapStore
     chrom_key: str
@@ -50,6 +58,8 @@ def _validate_and_collect_inputs(
     input_stores: Sequence[str | Path | HapStore],
     chrom_key: str,
 ) -> list[_InputChrom]:
+    """Open inputs and collect the structural state required by concat."""
+
     collected: list[_InputChrom] = []
 
     for item in input_stores:
@@ -118,6 +128,8 @@ def _validate_variant_axis_streaming(
     sources: Sequence[_InputChrom],
     variant_chunk: int,
 ) -> None:
+    """Compare complete ordered variant metadata without loading it at once."""
+
     reference = sources[0]
     for idx, src in enumerate(sources[1:], start=1):
         if src.n_variants != reference.n_variants:
@@ -198,6 +210,8 @@ def _write_variant_axis_from_reference(
     variant_chunk: int,
     compressor: Zstd,
 ) -> None:
+    """Copy the reference source's ordered variant metadata into the output."""
+
     ref_variants = reference.variants_group
     variant_group.create_dataset(
         "pos",
@@ -233,6 +247,8 @@ def _write_variant_axis_from_reference(
 
 
 def _merge_populations_or_none(sources: Sequence[_InputChrom]) -> np.ndarray | None:
+    """Append population labels, requiring either all or no sources to have them."""
+
     first_has = sources[0].populations is not None
     for idx, src in enumerate(sources[1:], start=1):
         if (src.populations is not None) != first_has:
@@ -283,6 +299,8 @@ ValidateMode = Literal["spot", "full", "none"]
 
 @dataclass(frozen=True)
 class _ResolvedLayout:
+    """Compression and chunk policy resolved for the output store."""
+
     compressor: Zstd
     compression_level: int
     variant_chunk_attr: int
@@ -310,7 +328,66 @@ def concat_hapstores(
 ) -> HapStore:
     """Concatenate multiple HapStores along the sample or variant axis.
 
-    This is a concat (stacking) operation, not a join/merge-by-key.
+    This is a stacking operation, not a join or merge by key. Input order is
+    preserved. Sample-axis concatenation appends diploid samples and requires
+    an identical ordered variant axis. Variant-axis concatenation appends
+    variant columns without sorting and requires an identical ordered sample
+    axis.
+
+    Args:
+        input_stores: Ordered input paths or open HapStore instances.
+        output_store: Destination path for the HapStore Zarr hierarchy.
+        chrom: Chromosome present in every input. The key is normalized to the
+            ``chrN`` form used by HapStore.
+        axis: ``"samples"``/``0`` appends haplotype rows; ``"variants"``/``1``
+            appends variant columns.
+        validate: ``"full"`` scans the complete required input invariant;
+            ``"spot"`` uses deterministic input and output slab checks; and
+            ``"none"`` skips optional content checks. Structural checks and
+            axis-defining sample checks still run for every mode.
+        n_workers: Maximum copy workers. The count is capped by the number of
+            sources. Variant concat and sample concat with genotype
+            materialization currently use one worker.
+        compression_level: Output Zstandard level. Passing ``None`` inherits
+            the level only when all source attributes agree.
+        chunk_variant_size: Output variant chunk size. Passing ``None``
+            inherits the size only when all source attributes agree.
+        chunk_haplotype_size: Requested output haplotype chunk size. When
+            omitted, the shared matrix chunk policy selects it.
+        chunk_sample_size: Requested output genotype sample chunk size. When
+            omitted, the shared matrix chunk policy selects it.
+        store_genotypes: Materialize output genotypes by pairing the copied
+            haplotypes. Source genotype arrays are not concatenated.
+        strict_variant_ids: For sample concat, compare ordered ``pos``,
+            ``ref``, ``alt``, ``vid``, and optional ``genetic_pos`` metadata
+            when validation is enabled. When ``False``, metadata from the first
+            source defines the output without comparing the other sources.
+        forbid_duplicate_variants: For variant concat, require source ranges
+            to be nondecreasing. Under full validation, also reject duplicate
+            non-missing variant IDs and duplicate ``(pos, ref, alt)`` keys.
+        attrs: Additional output chromosome attributes. ``source`` and
+            ``build`` are routed through the standard chromosome metadata.
+        overwrite: Replace an existing destination after the temporary output
+            has completed successfully.
+        tmp_suffix: Suffix used for the temporary sibling output path.
+
+    Returns:
+        A read-only HapStore opened at ``output_store``.
+
+    Raises:
+        ValueError: If parameters or required cross-source invariants are
+            invalid.
+        FileExistsError: If the output or temporary path already exists and
+            ``overwrite`` is ``False``.
+        KeyError: If required datasets are missing in the input stores.
+
+    Notes:
+        Sample concat without genotype materialization can parallelize either
+        by source or by disjoint output haplotype chunk. Compatible complete
+        Zarr chunks may be copied without decoding; other layouts use decoded
+        array blocks. The output is constructed under ``tmp_suffix`` and
+        promoted by rename. If overwrite promotion fails, the previous output
+        is restored; failed temporary output is removed.
     """
     if not input_stores:
         raise ValueError("input_stores must not be empty")
@@ -446,6 +523,8 @@ def _resolve_layout(
     chunk_sample_size: int | None,
     store_genotypes: bool,
 ) -> _ResolvedLayout:
+    """Resolve output compression and chunk overrides against source metadata."""
+
     attrs0 = sources[0].store.attrs(chrom_key)
     default_level = int(attrs0.get("compression_level", 3))
     default_variant_chunk = int(
@@ -524,6 +603,13 @@ def _concat_samples_into_store(
     resolved: _ResolvedLayout,
     attrs: dict | None,
 ) -> None:
+    """Append samples while preserving one identical ordered variant axis.
+
+    Source sample and haplotype rows are written in ``sources`` order. Variant
+    metadata is copied from the first source after the requested validation.
+    Duplicate sample IDs are always rejected.
+    """
+
     logger = logging.getLogger(__name__)
     if out.has_chromosome(chrom_key):
         raise ValueError(
@@ -677,6 +763,13 @@ def _concat_variants_into_store(
     resolved: _ResolvedLayout,
     attrs: dict | None,
 ) -> None:
+    """Append variant columns while preserving one identical sample axis.
+
+    Source variants are written in ``sources`` order and are not sorted or
+    harmonized. Sample IDs, sample order, and population labels are always
+    required to match the first source.
+    """
+
     logger = logging.getLogger(__name__)
     if out.has_chromosome(chrom_key):
         raise ValueError(
@@ -847,7 +940,11 @@ def _concat_variants_into_store(
             extra=attrs_payload or None,
         )
     )
+
+
 def _spot_validate_variant_axis(*, sources: Sequence[_InputChrom], variant_chunk: int) -> None:
+    """Deterministically compare boundary and sampled variant metadata chunks."""
+
     reference = sources[0]
     n_variants = int(reference.n_variants)
     n_chunks = int((n_variants + variant_chunk - 1) // variant_chunk)
@@ -932,6 +1029,8 @@ def _spot_validate_dense_copy(
     hap_chunk: int,
     variant_chunk: int,
 ) -> None:
+    """Deterministically compare five copied output slabs with their sources."""
+
     out_haps = out.root[chrom_key]["haplotypes"]
 
     seed = stable_seed(

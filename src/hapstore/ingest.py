@@ -367,8 +367,8 @@ def _ingest_vcf_via_plink2_bridge(
 ) -> HapStore:
     """Ingest a chromosome through the PLINK2-to-PGEN bridge.
 
-    This path converts the VCF to a temporary PGEN triplet and then ingests
-    that triplet into HapStore.
+    This path converts the VCF to a temporary PGEN/PVAR/PSAM triplet and then
+    ingests that triplet into HapStore.
     """
     if not _bridge_backend_supported(
         on_missing_ref_alt=on_missing_ref_alt,
@@ -660,15 +660,15 @@ def ingest_vcf(
     scratch_dir: str | Path | None = None,
     cleanup_intermediates: bool = True,
 ) -> HapStore:
-    """Ingest one phased VCF/BCF chromosome into a HapStore.
+    """Ingest one phased VCF or BCF chromosome into a HapStore.
 
     With multiple reader workers, pysam and cyvcf2 use staged base-pair shards
-    and ordered streaming finalization. Auto mode prefers the PLINK2 bridge
-    when its metadata policies are compatible and otherwise uses pysam.
+    and ordered streaming finalization. ``backend="auto"`` prefers the PLINK2
+    bridge when its metadata policies are compatible and otherwise uses pysam.
 
     Args:
         vcf_path: Path to a VCF or BCF file.
-        output_zarr: HapStore Zarr hierarchy to create or append to.
+        output_zarr: Path to the HapStore Zarr hierarchy to create or append to.
         chrom: Chromosome name or number to ingest.
         genetic_map_path: Optional genetic map used to interpolate cM positions.
         sample_ids: Optional sample subset in the desired output order.
@@ -685,15 +685,16 @@ def ingest_vcf(
         on_unphased_gt: Reject unphased heterozygotes or mark both alleles
             missing. Unphased homozygotes remain unambiguous.
         on_multiallelic: Reject or skip multiallelic records.
-        workers: Positive number of reader workers.
+        workers: Positive number of reader workers. Values greater than one
+            use staged ingestion for pysam and cyvcf2.
         partition_bp: Optional staged-ingestion shard width in base pairs.
         scratch_dir: Optional staged-artifact root. Otherwise, node-local
             ``/scratch/tmp`` is preferred before the system temporary directory.
         cleanup_intermediates: Remove staged artifacts after completion or
-            failure; retained artifacts are logged when false.
+            failure; retained artifacts are logged when ``False``.
 
     Returns:
-        The HapStore containing the completed chromosome.
+        The completed HapStore opened at ``output_zarr``.
 
     Raises:
         FileNotFoundError: If the VCF file does not exist.
@@ -905,7 +906,7 @@ def ingest_arrays(
     """Ingest in-memory arrays into a HapStore.
 
     Args:
-        output_zarr: HapStore Zarr hierarchy to create or append to.
+        output_zarr: Path to the HapStore Zarr hierarchy to create or append to.
         chrom: Chromosome name or number to ingest.
         haplotypes: Phased ``uint8``-compatible array with shape ``(2N, V)``.
         variant_pos: One-based physical positions with shape ``(V,)``.
@@ -923,7 +924,11 @@ def ingest_arrays(
         attrs: Optional caller-supplied chromosome provenance metadata.
 
     Returns:
-        The HapStore containing the completed chromosome.
+        The completed HapStore opened at ``output_zarr``.
+
+    Raises:
+        ValueError: If array shapes, values, sample identity, or storage
+            settings violate the HapStore contract.
 
     Notes:
         Input row and column order is preserved. If ingestion fails after
@@ -1211,9 +1216,9 @@ def _resolve_staged_partition_bp(
     """Resolve the base-pair partition size for staged ingestion.
 
     Args:
-        vcf: A pysam.VariantFile object for the VCF/BCF.
-        contig: The chromosome/contig name to ingest.
-        workers: The number of parallel workers to use.
+        vcf: Open ``pysam.VariantFile`` for the VCF or BCF.
+        contig: Chromosome or contig name to ingest.
+        workers: Number of parallel workers.
         partition_bp: Optional user-specified partition size in base pairs.
 
     Returns:
@@ -1397,7 +1402,7 @@ def _read_cyvcf2_shard_worker(
 ) -> _ShardResult:
     """Read one cyvcf2 shard using the pysam worker's output contract.
 
-    See :func:`_read_pysam_shard_worker` for the shared allele, missingness,
+    See ``_read_pysam_shard_worker()`` for the shared allele, missingness,
     phasing, ordering, and diagnostic-count semantics. This implementation
     selects samples by name and converts the shared zero-based, half-open shard
     bounds to cyvcf2's one-based region syntax.

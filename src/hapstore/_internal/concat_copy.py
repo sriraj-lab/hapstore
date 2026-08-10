@@ -1,4 +1,11 @@
-"""Dense matrix copy backend for HapStore concatenation."""
+"""Dense matrix copy backend for HapStore concatenation.
+
+Write plans map each source onto a disjoint output interval. Parallel sample
+concatenation normally assigns whole sources to workers; when a source boundary
+falls inside an output chunk, ownership switches to complete output haplotype
+chunks so two processes never write the same chunk. Compatible compressed Zarr
+chunks can be copied directly when genotype materialization is not requested.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +22,8 @@ from hapstore.store import HapStore, _haplotypes_to_genotypes
 
 @dataclass(frozen=True)
 class _SourceWritePlan:
+    """Source dimensions and its haplotype/variant offset in the output."""
+
     source_path: Path
     source_n_haps: int
     source_n_vars: int
@@ -23,6 +32,8 @@ class _SourceWritePlan:
 
 
 def _build_sample_axis_plans(sources: Sequence[Any]) -> list[_SourceWritePlan]:
+    """Assign consecutive output haplotype intervals in source order."""
+
     plans: list[_SourceWritePlan] = []
     hap_offset = 0
     for src in sources:
@@ -40,6 +51,8 @@ def _build_sample_axis_plans(sources: Sequence[Any]) -> list[_SourceWritePlan]:
 
 
 def _build_variant_axis_plans(sources: Sequence[Any]) -> list[_SourceWritePlan]:
+    """Assign consecutive output variant intervals in source order."""
+
     plans: list[_SourceWritePlan] = []
     var_offset = 0
     for src in sources:
@@ -69,6 +82,14 @@ def _copy_dense_matrices(
     sample_chunk_geno: int,
     logger: logging.Logger,
 ) -> None:
+    """Dispatch dense copies using serial, source-owned, or chunk-owned writes.
+
+    Source-owned parallel writes are safe when each sample-concat source ends
+    on an output haplotype chunk boundary. Otherwise, complete output chunks
+    become the work units. The public coordinator currently passes one worker
+    for variant concat and whenever output genotypes are requested.
+    """
+
     if n_workers <= 1:
         for plan in plans:
             _worker_copy_source(
@@ -137,6 +158,8 @@ def _copy_dense_matrices(
 
 @dataclass(frozen=True)
 class _OutputChunkTask:
+    """One output haplotype chunk and the source slices that populate it."""
+
     out_h0: int
     out_h1: int
     overlaps: tuple[tuple[Path, int, int, int, int], ...]
@@ -157,6 +180,8 @@ def _filters_config(filters: Any) -> Any:
 
 
 def _arrays_support_direct_chunk_copy(src_arr: Any, out_arr: Any) -> bool:
+    """Return whether encoded source chunks can be reused by the output."""
+
     return (
         tuple(src_arr.chunks) == tuple(out_arr.chunks)
         and np.dtype(src_arr.dtype) == np.dtype(out_arr.dtype)
@@ -178,6 +203,8 @@ def _copy_raw_haplotype_chunks(
     src_chunk_index: int,
     out_chunk_index: int,
 ) -> None:
+    """Copy every encoded variant chunk for one complete haplotype chunk."""
+
     n_var_chunks = int((int(src_arr.shape[1]) + int(src_arr.chunks[1]) - 1) // int(src_arr.chunks[1]))
     for var_chunk_index in range(n_var_chunks):
         src_key = src_arr._chunk_key((int(src_chunk_index), int(var_chunk_index)))
@@ -195,6 +222,8 @@ def _try_direct_copy_source_chunks(
     store_genotypes: bool,
     logger: logging.Logger,
 ) -> bool:
+    """Copy a complete chunk-aligned source interval without decoding it."""
+
     if store_genotypes or not _arrays_support_direct_chunk_copy(src_haps, out_haps):
         return False
 
@@ -235,6 +264,8 @@ def _try_direct_copy_output_hap_chunk(
     store_genotypes: bool,
     logger: logging.Logger,
 ) -> bool:
+    """Copy one complete source chunk into one complete output chunk."""
+
     if store_genotypes or not _arrays_support_direct_chunk_copy(src_haps, out_haps):
         return False
 
@@ -278,6 +309,8 @@ def _copy_dense_matrices_parallel_by_output_hap_chunks(
     sample_chunk_geno: int,
     logger: logging.Logger,
 ) -> None:
+    """Build disjoint output-chunk tasks for sample-axis multiprocessing."""
+
     del sample_chunk_geno
     if total_haps <= 0:
         raise ValueError("total_haps must be > 0")
@@ -348,6 +381,8 @@ def _worker_copy_output_hap_chunk(
     variant_chunk: int,
     log_queue,
 ) -> None:
+    """Populate one output chunk from its ordered set of source overlaps."""
+
     import logging.handlers
 
     logger = logging.getLogger(__name__)
@@ -446,6 +481,8 @@ def _worker_copy_source(
     sample_chunk_geno: int,
     log_queue,
 ) -> None:
+    """Copy one source into its assigned output interval in bounded blocks."""
+
     import logging.handlers
 
     logger = logging.getLogger(__name__)
