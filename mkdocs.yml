@@ -1,0 +1,59 @@
+site_name: HapStore
+site_description: Zarr-backed phased haplotype storage with VCF and PGEN I/O.
+repo_name: sriraj-lab/hapstore
+repo_url: https://github.com/sriraj-lab/hapstore
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: teal
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: teal
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            members_order: source
+            show_root_full_path: false
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_source: false
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Overview: index.md
+  - Quickstart: quickstart.md
+  - Guides:
+      - Ingest a phased VCF: guides/ingest-vcf.md
+      - Extract a numerical cM window: guides/numerical-window.md
+  - API Reference:
+      - Core store: api/store.md
+      - Data objects: api/data-objects.md
+      - Ingest, export, and concat: api/io.md
+      - Helpers: api/helpers.md
+  - Maintainers:
+      - Internal architecture: internal-architecture.md

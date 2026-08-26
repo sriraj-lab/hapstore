@@ -20,6 +20,12 @@ dependencies = [
 pgen = ["pgenlib>=0.93"]
 vcf-fast = ["cyvcf2>=0.30"]
 dev = ["pytest>=8.0"]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.6",
+    "mkdocstrings[python]>=0.29",
+    "ruff>=0.11",
+]
 
 [project.urls]
 Homepage = "https://github.com/sriraj-lab/hapstore"
