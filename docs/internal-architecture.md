@@ -20,8 +20,19 @@ The public API is exposed from `src/hapstore/__init__.py` and includes:
 - sample/chromosome/window helper functions
 
 Implementation modules such as `pgen.py`, `store.py`, `ingest.py`, `concat.py`,
-and `export.py` may be imported by tests and internal callers, but the stable
-user-facing import path should remain `from hapstore import ...`.
+`export_vcf.py`, and `subset.py` may be imported by tests and internal callers,
+but the stable user-facing import path should remain `from hapstore import ...`.
+
+`export_vcf.py` owns native VCF writing and the optional
+`HapStore -> PGEN -> PLINK2 -> VCF` bridge. It delegates PGEN materialization,
+including parallel sharding and merging, to `pgen.export_pgen(...)` rather than
+maintaining a second sharding path. A single PLINK2 invocation then creates the
+VCF, with a separate thread count.
+
+`subset.py` owns the distinct sample-axis copy operation. The older
+`export.py` path is a compatibility shim that re-exports both functions; new
+code should import from the top-level package or the specific implementation
+module.
 
 ## PGEN Module Split
 

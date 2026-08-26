@@ -1130,6 +1130,11 @@ class HapStore:
         sample_indices: np.ndarray,
         dtype: np.dtype,
     ) -> np.ndarray:
+        """Read one selected data block while preserving requested row order.
+
+        Genotypes use a materialized dataset when available and otherwise are
+        reconstructed from the paired haplotype rows.
+        """
         n_variants = int(variant_indices.size)
 
         if data == "haplotypes":
@@ -1175,6 +1180,7 @@ class HapStore:
         chrom_group: zarr.Group,
         variant_indices: np.ndarray,
     ) -> dict[str, Any]:
+        """Read metadata for selected variants without changing caller order."""
         variants = chrom_group["variants"]
         n_variants = int(variant_indices.size)
         groups = _plan_variant_read_groups(
@@ -1526,6 +1532,7 @@ class HapStore:
         chrom: str | int,
         sample_indices: Sequence[int] | np.ndarray | None,
     ) -> np.ndarray:
+        """Resolve an optional index vector or mask to stored sample rows."""
         n_samples = self.n_samples(chrom)
         if sample_indices is None:
             return np.arange(n_samples, dtype=np.int64)
@@ -1547,6 +1554,7 @@ class HapStore:
         request: HapStoreDosageRequest | dict[str, Any] | tuple[Hashable, Sequence[str] | Sequence[int] | np.ndarray],
         fallback_index: int,
     ) -> tuple[Hashable, Sequence[str] | None, Sequence[int] | np.ndarray | None]:
+        """Normalize one supported dosage-request form to its ID and selector."""
         if isinstance(request, HapStoreDosageRequest):
             request_id = request.request_id
             variant_ids = request.variant_ids

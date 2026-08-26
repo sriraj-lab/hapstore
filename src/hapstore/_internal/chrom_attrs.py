@@ -22,6 +22,7 @@ def build_chrom_attrs(
     build: Any = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build the standardized attribute payload for one HapStore chromosome."""
     return {
         "n_samples": int(n_samples),
         "n_haplotypes": int(n_haplotypes),

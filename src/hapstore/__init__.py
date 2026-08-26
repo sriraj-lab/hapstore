@@ -2,10 +2,11 @@
 
 from .chrom import candidate_contigs, normalize_chrom, uses_chr_prefix
 from .concat import concat_hapstores
-from .export import export_vcf, subset_samples_to_new_store
+from .export_vcf import export_vcf
 from .ingest import ingest_arrays, ingest_vcf
 from .ids import align_by_ids, ensure_id_column, read_sample_ids
 from .pgen import export_pgen, ingest_pgen
+from .subset import subset_samples_to_new_store
 from .seeding import stable_seed
 from .store import HapStore, HapStoreBlock, HapStoreDosageBatch, HapStoreDosageRequest
 from .windows import compute_window_boundaries, compute_window_midpoints

@@ -1,4 +1,4 @@
-"""Shared sample/variant selection helpers for export paths."""
+"""Shared sample/variant selection helpers for VCF and PGEN exports."""
 
 from __future__ import annotations
 
@@ -104,6 +104,11 @@ def _resolve_variant_indices_streaming(
     variant_ids: list[str],
     scan_block_size: int,
 ) -> list[int]:
+    """Resolve unique position or ID aliases through chunk-bounded scans.
+
+    Returned indices are unique and sorted in HapStore variant order, not the
+    order in which aliases were requested.
+    """
     if len(set(variant_ids)) != len(variant_ids):
         raise ValueError("variant_ids must be unique")
     if not variant_ids:

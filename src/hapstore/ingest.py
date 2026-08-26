@@ -44,8 +44,8 @@ from hapstore.chrom import candidate_contigs, normalize_chrom
 
 from ._internal.command import CommandExecutionError, run_cmd
 from ._internal.chunking import DEFAULT_VARIANT_CHUNK_SIZE
-from ._internal._ingest_index import _has_tabix_index
-from ._internal._ingest_readers import (
+from ._internal.ingest_index import _has_tabix_index
+from ._internal.ingest_readers import (
     _coerce_ref_alt,
     _coerce_vid,
     _extract_vcf_arrays,
@@ -53,7 +53,7 @@ from ._internal._ingest_readers import (
     _extract_vcf_arrays_pysam,
     _resolve_subset,
 )
-from ._internal._ingest_sharding import (
+from ._internal.ingest_sharding import (
     _build_shard_ranges,
     _infer_contig_bounds_from_records,
     _resolve_contig_span_bounds_for_parallel,
@@ -308,6 +308,11 @@ def _run_plink2_vcf_to_pgen(
     workers: int,
     skip_multiallelic: bool,
 ) -> tuple[Path, str]:
+    """Materialize one candidate VCF contig as a temporary PLINK2 PGEN triplet.
+
+    Contig aliases are tried in order so the bridge reports one aggregated
+    failure only after every compatible naming convention fails.
+    """
     plink2_bin = resolve_plink2_binary("plink2")
     failures: list[str] = []
     for contig in candidate_contigs(chrom):
@@ -445,6 +450,7 @@ def _single_shard_store_from_extract(
     parallel_mode: str = "single_shard",
     partition_seconds: float | None = None,
 ) -> HapStore:
+    """Create one transactional chromosome store from a completed reader extract."""
     ingested = extract_fn()
     map_df = _load_genetic_map_df(genetic_map_path, chrom=chrom)
     genetic_positions = _interpolate_genetic_positions(ingested.positions, map_df=map_df, chrom=chrom)

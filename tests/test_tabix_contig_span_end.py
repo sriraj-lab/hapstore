@@ -65,7 +65,7 @@ def test_build_shard_ranges_uses_tabix_when_contig_length_missing(tmp_path, monk
     def _boom(*_args, **_kwargs):
         raise RuntimeError("should not scan contig bounds when tabix index is available")
 
-    from hapstore._internal import _ingest_sharding as sharding_mod
+    from hapstore._internal import ingest_sharding as sharding_mod
 
     monkeypatch.setattr(sharding_mod, "_infer_contig_bounds_from_records", _boom)
 
@@ -82,7 +82,7 @@ def test_build_shard_ranges_uses_tabix_when_contig_length_missing(tmp_path, monk
 
 
 def test_csi_span_parser_uses_real_index_header_and_bins(tmp_path):
-    from hapstore._internal._ingest_index import _resolve_contig_span_end_from_tabix_index
+    from hapstore._internal.ingest_index import _resolve_contig_span_end_from_tabix_index
 
     vcf_path = _write_indexed_pysam_vcf_missing_contig_length(
         tmp_path / "csi.vcf.gz",

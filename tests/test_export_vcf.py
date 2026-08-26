@@ -6,7 +6,7 @@ import pytest
 import shutil
 
 from hapstore import HapStore, export_vcf, ingest_arrays
-from hapstore.export import subset_samples_to_new_store
+from hapstore.subset import subset_samples_to_new_store
 from ._vcf_helpers import extract_haplotypes, get_sample_ids
 
 
@@ -30,6 +30,14 @@ def _build_store_for_export(path):
         alt=["G", "T"],
         vid=["rs1", "rs2"],
     )
+
+
+def test_legacy_export_module_reexports_public_apis():
+    from hapstore.export import export_vcf as legacy_export_vcf
+    from hapstore.export import subset_samples_to_new_store as legacy_subset_samples
+
+    assert legacy_export_vcf is export_vcf
+    assert legacy_subset_samples is subset_samples_to_new_store
 
 
 def test_export_vcf_roundtrip(tmp_path):
@@ -241,7 +249,7 @@ def test_export_vcf_via_pgen_preserves_content(tmp_path):
         chrom="1",
         bgzip=False,
         plink2_location="system",
-        n_shards=2,
+        pgen_workers=2,
         keep_intermediate_files=True,
     )
 
@@ -279,7 +287,7 @@ def test_export_vcf_via_pgen_removes_intermediates_by_default(tmp_path):
         chrom="1",
         bgzip=False,
         plink2_location="system",
-        n_shards=2,
+        pgen_workers=2,
         keep_intermediate_files=False,
     )
 
@@ -291,31 +299,28 @@ def test_export_vcf_via_pgen_removes_intermediates_by_default(tmp_path):
 
 
 def test_export_vcf_via_pgen_cleanup_is_covered_without_plink(monkeypatch, tmp_path):
-    import hapstore.export as export_mod
+    import importlib
+
+    export_mod = importlib.import_module("hapstore.export_vcf")
     import hapstore.pgen as pgen_mod
     from hapstore._internal import command as command_mod
 
     monkeypatch.setattr(export_mod, "resolve_plink2_binary", lambda _location: Path("plink2"))
 
-    def fake_export_pgen(*, out_prefix, **_kwargs):
+    export_pgen_kwargs = {}
+    commands = []
+
+    def fake_export_pgen(*, out_prefix, **kwargs):
+        export_pgen_kwargs.update(kwargs)
         prefix = Path(out_prefix)
         for ext in (".pgen", ".pvar", ".psam"):
             Path(f"{prefix}{ext}").write_text("stub\n", encoding="utf-8")
         return prefix
 
     def fake_run_cmd(cmd, **_kwargs):
-        if "--pmerge-list" in cmd:
-            merge_list = Path(cmd[cmd.index("--pmerge-list") + 1])
-            for line in merge_list.read_text(encoding="utf-8").splitlines():
-                prefix = Path(line)
-                for ext in (".pgen", ".pvar", ".psam"):
-                    assert Path(f"{prefix}{ext}").exists()
-            merged_prefix = Path(cmd[cmd.index("--out") + 1])
-            for ext in (".pgen", ".pvar", ".psam"):
-                Path(f"{merged_prefix}{ext}").write_text("stub\n", encoding="utf-8")
-        if "--export" in cmd:
-            out_prefix = Path(cmd[cmd.index("--out") + 1])
-            Path(f"{out_prefix}.vcf").write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+        commands.append(cmd)
+        out_prefix = Path(cmd[cmd.index("--out") + 1])
+        Path(f"{out_prefix}.vcf").write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
 
     monkeypatch.setattr(pgen_mod, "export_pgen", fake_export_pgen)
     monkeypatch.setattr(command_mod, "run_cmd", fake_run_cmd)
@@ -329,13 +334,71 @@ def test_export_vcf_via_pgen_cleanup_is_covered_without_plink(monkeypatch, tmp_p
         chrom="1",
         bgzip=False,
         plink2_location="system",
-        n_shards=2,
+        pgen_workers=2,
+        plink2_workers=3,
         keep_intermediate_files=False,
     )
 
     assert result == output_vcf
     assert output_vcf.exists()
     assert not list(tmp_path.glob("hapstore_export_vcf_*"))
+    assert export_pgen_kwargs["n_workers"] == 2
+    assert export_pgen_kwargs["plink2_workers"] == 3
+    assert "shard_tmp_dir" in export_pgen_kwargs
+    assert commands[0][1:3] == ["--threads", "3"]
+
+
+def test_export_vcf_n_shards_compatibility_alias(monkeypatch, tmp_path):
+    import importlib
+
+    export_mod = importlib.import_module("hapstore.export_vcf")
+    import hapstore.pgen as pgen_mod
+    from hapstore._internal import command as command_mod
+
+    monkeypatch.setattr(export_mod, "resolve_plink2_binary", lambda _location: Path("plink2"))
+    received = {}
+
+    def fake_export_pgen(*, out_prefix, **kwargs):
+        received.update(kwargs)
+        prefix = Path(out_prefix)
+        for ext in (".pgen", ".pvar", ".psam"):
+            Path(f"{prefix}{ext}").write_text("stub\n", encoding="utf-8")
+        return prefix
+
+    def fake_run_cmd(cmd, **_kwargs):
+        out_prefix = Path(cmd[cmd.index("--out") + 1])
+        Path(f"{out_prefix}.vcf").write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+
+    monkeypatch.setattr(pgen_mod, "export_pgen", fake_export_pgen)
+    monkeypatch.setattr(command_mod, "run_cmd", fake_run_cmd)
+
+    store_path = tmp_path / "compat_store.zarr"
+    _build_store_for_export(store_path)
+    with pytest.warns(DeprecationWarning, match="n_shards"):
+        export_vcf(
+            store_path=store_path,
+            output_vcf=tmp_path / "compat.vcf",
+            chrom="1",
+            bgzip=False,
+            plink2_location="system",
+            n_shards=2,
+        )
+
+    assert received["n_workers"] == 2
+
+
+def test_export_vcf_via_pgen_rejects_non_strict_variant_info(tmp_path):
+    store_path = tmp_path / "non_strict_store.zarr"
+    _build_store_for_export(store_path)
+
+    with pytest.raises(ValueError, match="strict_variant_info=False"):
+        export_vcf(
+            store_path=store_path,
+            output_vcf=tmp_path / "non_strict.vcf",
+            chrom="1",
+            plink2_location="system",
+            strict_variant_info=False,
+        )
 
 
 def test_subset_samples_to_new_store_streams_and_preserves_order(monkeypatch, tmp_path):

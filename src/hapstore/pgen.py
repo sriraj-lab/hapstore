@@ -30,7 +30,7 @@ from hapstore.chrom import normalize_chrom
 from hapstore.ids import read_sample_ids
 
 from ._internal.chunking import DEFAULT_VARIANT_CHUNK_SIZE
-from ._internal.export_selection import (
+from ._internal.selection import (
     _iter_variant_slices,
     _iter_variant_slices_for_indices,
     _plan_sample_subset,
@@ -539,7 +539,7 @@ def _export_pgen_single(
     vid_ds = variants["vid"]
     n_variants = int(pos_ds.shape[0])
 
-    # Force block size to a multiple of zarr chunk size for efficient reads
+    # Align large blocks to the Zarr variant chunk size for efficient reads.
     chunk_variant_size = int(
         store.attrs(chrom_key).get(
             "chunk_variant_size", DEFAULT_VARIANT_CHUNK_SIZE
@@ -585,7 +585,7 @@ def _export_pgen_single(
         for sid in sample_plan.selected_sample_ids:
             psam_handle.write(f"0\t{sid}\t0\t0\t0\t-9\n")
 
-    # Pre-load all variant metadata once to avoid per-block zarr reads
+    # Read metadata once per writer; PGEN and PVAR stay aligned block by block.
     all_pos = np.asarray(pos_ds[:], dtype=np.int64)
     all_ref = _to_unicode_array(np.asarray(ref_ds[:], dtype=object))
     all_alt = _to_unicode_array(np.asarray(alt_ds[:], dtype=object))

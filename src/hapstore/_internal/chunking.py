@@ -11,6 +11,8 @@ DEFAULT_MATRIX_CHUNK_TARGET_BYTES = 7_500_000
 
 @dataclass(frozen=True)
 class MatrixChunkLayout:
+    """Resolved chunk sizes for the variant, haplotype, and sample axes."""
+
     variant: int
     haplotype: int
     sample: int

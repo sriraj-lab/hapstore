@@ -15,7 +15,7 @@ from pathlib import Path
 
 from hapstore.chrom import candidate_contigs, normalize_chrom
 
-from ._ingest_index import _resolve_contig_span_end_from_tabix_index
+from .ingest_index import _resolve_contig_span_end_from_tabix_index
 
 
 def _select_contig_for_parallel(vcf: "pysam.VariantFile", chrom: str | int) -> str:

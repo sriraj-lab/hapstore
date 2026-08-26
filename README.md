@@ -145,7 +145,10 @@ export_pgen(
 - `backend="auto"` prefers the PLINK2 bridge when available and otherwise uses the required `pysam` reader. `cyvcf2` is available through the `vcf-fast` extra and must be selected explicitly.
 - Parallel staged VCF ingest requires indexed input (`.tbi` or `.csi`).
 - PGEN ingest streams bounded variant blocks. Use `scratch_dir` to place parallel shard intermediates on fast local storage.
-- `export_vcf(..., plink2_location=...)` uses the `HapStore -> PGEN -> VCF` bridge.
+- `export_vcf(..., plink2_location=...)` uses the `HapStore -> PGEN -> VCF`
+  bridge. Set `pgen_workers` to parallelize PGEN materialization,
+  `plink2_workers` to control PLINK2 threads, and `shard_tmp_dir` to place
+  transient PGEN shards on fast storage.
 
 ## Reader performance notes
 
