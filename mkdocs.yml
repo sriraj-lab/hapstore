@@ -51,9 +51,6 @@ nav:
       - Ingest a phased VCF: guides/ingest-vcf.md
       - Extract a numerical cM window: guides/numerical-window.md
   - API Reference:
-      - Core store: api/store.md
-      - Data objects: api/data-objects.md
-      - Ingest, export, and concat: api/io.md
+      - Core store and concatenation: api/store.md
+      - Ingest and export: api/io.md
       - Helpers: api/helpers.md
-  - Maintainers:
-      - Internal architecture: internal-architecture.md

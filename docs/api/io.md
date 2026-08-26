@@ -1,12 +1,10 @@
-# Ingest, Export, and Concatenation
+# Ingest and Export
 
 ::: hapstore.ingest_vcf
 
 ::: hapstore.ingest_arrays
 
 ::: hapstore.ingest_pgen
-
-::: hapstore.concat_hapstores
 
 ::: hapstore.export_vcf
 

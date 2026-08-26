@@ -61,9 +61,9 @@ Helpers:
 
 - The public MkDocs source begins at [`docs/index.md`](docs/index.md). Build it
   locally with `pip install -e ".[docs]"` followed by `mkdocs serve`.
-- [`docs/internal-architecture.md`](docs/internal-architecture.md) describes
-  the maintainer-facing public API boundary, internal helper layout, and
-  PGEN/pgenlib split.
+- [`maintainers/internal-architecture.md`](maintainers/internal-architecture.md)
+  describes the maintainer-facing public API boundary, internal helper layout,
+  and PGEN/pgenlib split. It is intentionally excluded from the public site.
 
 ## Benchmarks
 
