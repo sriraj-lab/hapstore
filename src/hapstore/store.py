@@ -50,6 +50,10 @@ class HapStoreDosageBatch:
     sorted ``variant_indices`` order. Each entry in ``request_columns`` maps
     the union matrix back to the original order, including duplicates, for one
     request.
+
+    ``positions``, ``ref`` and ``alt`` align with the union columns. They are
+    read only for selected variants, so callers need not load chromosome-wide
+    metadata to validate a batch's positions and alleles.
     """
 
     matrix: np.ndarray
@@ -58,6 +62,9 @@ class HapStoreDosageBatch:
     request_ids: tuple[Hashable, ...]
     variant_ids: tuple[str, ...] | None = None
     metrics: dict[str, Any] | None = None
+    positions: np.ndarray | None = None
+    ref: tuple[str, ...] | None = None
+    alt: tuple[str, ...] | None = None
 
     def window_matrix(self, request_id: Hashable) -> np.ndarray:
         """Return the dosage matrix for one request in its original order."""
@@ -1339,6 +1346,9 @@ class HapStore:
             request_ids=tuple(request_id for request_id, _indices, _ids in parsed),
             variant_ids=union_variant_ids,
             metrics=self.last_read_metrics,
+            positions=metadata['positions'],
+            ref=metadata['ref'],
+            alt=metadata['alt'],
         )
 
     def variant_positions(self, chrom: str | int) -> np.ndarray:

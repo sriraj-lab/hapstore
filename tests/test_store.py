@@ -718,6 +718,9 @@ def test_read_dosage_batch_window_matrix_and_project(tmp_path, synthetic_arrays,
     assert len(selected_metadata) == 1
     np.testing.assert_array_equal(selected_metadata[0], np.asarray([0, 1, 2]))
     assert batch.variant_ids == ("v1", "v2", "v3")
+    np.testing.assert_array_equal(batch.positions, synthetic_arrays['variant_pos'][:3])
+    assert batch.ref == tuple(synthetic_arrays['ref'][:3])
+    assert batch.alt == tuple(synthetic_arrays['alt'][:3])
     expected_a = store.read_dosages("1", variant_ids=["v3", "v1"], workers=1)
     np.testing.assert_allclose(batch.window_matrix("a"), expected_a, equal_nan=True)
 
