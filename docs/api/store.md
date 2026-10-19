@@ -47,6 +47,10 @@
 
 ::: hapstore.HapStore.read_dosage_batch
 
+::: hapstore.HapStore.read_haplotypes
+
+::: hapstore.HapStore.read_haplotype_batch
+
 ## Summarize Variant Frequencies
 
 ::: hapstore.HapStore.variant_maf
@@ -68,6 +72,10 @@
 ::: hapstore.HapStoreDosageRequest
 
 ::: hapstore.HapStoreDosageBatch
+    options:
+      members: true
+
+::: hapstore.HapStoreHaplotypeBatch
     options:
       members: true
 

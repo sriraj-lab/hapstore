@@ -56,3 +56,5 @@ assert dosages.shape == (2, 2)
 
 For repeated overlapping windows, use `read_dosage_batch` to share a single
 union read and then recover each window in its requested order.
+`read_haplotypes` and `read_haplotype_batch` provide the same threaded and
+union reads for phased haplotypes, for example to fit local haplotype PCA bases.

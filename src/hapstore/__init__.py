@@ -8,13 +8,14 @@ from .ids import align_by_ids, ensure_id_column, read_sample_ids
 from .pgen import export_pgen, ingest_pgen
 from .subset import subset_samples_to_new_store
 from .seeding import stable_seed
-from .store import HapStore, HapStoreBlock, HapStoreDosageBatch, HapStoreDosageRequest
+from .store import HapStore, HapStoreBlock, HapStoreDosageBatch, HapStoreDosageRequest, HapStoreHaplotypeBatch
 from .windows import compute_window_boundaries, compute_window_midpoints
 
 __all__ = [
     "HapStore",
     "HapStoreBlock",
     "HapStoreDosageBatch",
+    "HapStoreHaplotypeBatch",
     "HapStoreDosageRequest",
     "ingest_vcf",
     "ingest_arrays",

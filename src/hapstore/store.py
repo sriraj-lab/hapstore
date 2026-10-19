@@ -84,6 +84,33 @@ class HapStoreDosageBatch:
 
 
 @dataclass(frozen=True)
+class HapStoreHaplotypeBatch:
+    """Shared union haplotype matrix and mappings for individual requests.
+
+    ``matrix`` is ``uint8`` with shape ``(2 * n_samples, n_union_variants)``;
+    rows ``2i`` and ``2i + 1`` are the two haplotypes of requested sample
+    ``i``, and columns follow the sorted ``variant_indices`` order.
+    ``request_columns`` maps the union matrix back to each request's original
+    variant order, including duplicates. Overlapping requests (for example,
+    overlapping genomic windows) read every stored chunk once.
+    """
+
+    matrix: np.ndarray
+    variant_indices: np.ndarray
+    request_columns: dict[Hashable, np.ndarray]
+    request_ids: tuple[Hashable, ...]
+    variant_ids: tuple[str, ...] | None = None
+    metrics: dict[str, Any] | None = None
+    positions: np.ndarray | None = None
+    ref: tuple[str, ...] | None = None
+    alt: tuple[str, ...] | None = None
+
+    def window_matrix(self, request_id: Hashable) -> np.ndarray:
+        """Return the haplotype matrix for one request in its original order."""
+        return np.asarray(self.matrix[:, self.request_columns[request_id]], dtype=np.uint8)
+
+
+@dataclass(frozen=True)
 class HapStoreBlock:
     """One variant-axis block with aligned values and variant metadata.
 
@@ -935,10 +962,47 @@ class HapStore:
                 assume_no_missing=assume_no_missing,
             )
 
-        arr_name = "genotypes" if "genotypes" in chrom_group else "haplotypes"
-        arr = chrom_group[arr_name]
         attrs = self.attrs(chrom)
         has_missing = bool(attrs.get("has_missing", True)) and not bool(assume_no_missing)
+        return self._read_tiles(
+            chrom,
+            variant_idx=variant_idx,
+            sample_idx=sample_idx,
+            output="dosages",
+            target_dtype=target_dtype,
+            missing_mode=missing_mode,
+            has_missing=has_missing,
+            assume_no_missing=assume_no_missing,
+            workers=workers,
+        )
+
+    def _read_tiles(
+        self,
+        chrom: str | int,
+        *,
+        variant_idx: np.ndarray,
+        sample_idx: np.ndarray,
+        output: str,
+        target_dtype: np.dtype,
+        missing_mode: str,
+        has_missing: bool,
+        assume_no_missing: bool,
+        workers: int | str,
+    ) -> np.ndarray:
+        """Threaded chunk-tile reader shared by dosage and haplotype reads.
+
+        ``output="dosages"`` returns ``(n_samples, n_variants)`` values in
+        ``target_dtype``. ``output="haplotypes"`` reads the haplotype dataset
+        and returns ``uint8`` of shape ``(2 * n_samples, n_variants)`` with
+        rows ``2i`` and ``2i + 1`` holding requested sample ``i``; missing
+        alleles keep the stored sentinel.
+        """
+        chrom_group = self._require_chromosome(chrom)
+        if output == "haplotypes":
+            arr_name = "haplotypes"
+        else:
+            arr_name = "genotypes" if "genotypes" in chrom_group else "haplotypes"
+        arr = chrom_group[arr_name]
         variant_chunk = int(arr.chunks[1])
         if arr_name == "genotypes":
             row_chunk = int(arr.chunks[0])
@@ -989,7 +1053,8 @@ class HapStore:
             + max_output_rows * max_output_cols * row_factor * input_itemsize
             + max_output_rows * max_output_cols * target_dtype.itemsize
         )
-        output_bytes = int(sample_idx.size * variant_idx.size * target_dtype.itemsize)
+        n_out_rows = 2 * sample_idx.size if output == "haplotypes" else sample_idx.size
+        output_bytes = int(n_out_rows * variant_idx.size * target_dtype.itemsize)
         worker_count, worker_policy = _resolve_read_worker_count(
             workers,
             n_tasks=total_tasks,
@@ -1003,7 +1068,7 @@ class HapStore:
             estimated_tile_bytes=estimated_tile_bytes,
             output_bytes=output_bytes,
         )
-        out = np.empty((sample_idx.size, variant_idx.size), dtype=target_dtype)
+        out = np.empty((n_out_rows, variant_idx.size), dtype=target_dtype)
         local = threading.local()
         path = str(self._path)
         chrom_key = self._chrom_key(chrom)
@@ -1035,8 +1100,18 @@ class HapStore:
                 )
             tile_read_sec = time.perf_counter() - read_start
             convert_start = time.perf_counter()
+            sample_sel = _index_selector(sample_group.offsets)
+            variant_sel = _index_selector(variant_group.offsets)
+            if output == "haplotypes":
+                if isinstance(sample_sel, slice):
+                    # Consecutive samples: haplotype rows are already interleaved in order.
+                    hap = _take(block, slice(2 * sample_sel.start, 2 * sample_sel.stop), variant_sel)
+                else:
+                    hap = _take(block, _haplotype_rows(sample_group.offsets), variant_sel)
+                tile_convert_sec = time.perf_counter() - convert_start
+                return sample_group.out_positions, variant_group.out_positions, hap, tile_read_sec, tile_convert_sec
             if arr_name == "genotypes":
-                values_u8 = block[np.ix_(sample_group.offsets, variant_group.offsets)]
+                values_u8 = _take(block, sample_sel, variant_sel)
                 values = _format_genotype_values(
                     values_u8,
                     dtype=target_dtype,
@@ -1044,10 +1119,8 @@ class HapStore:
                     has_missing=has_missing,
                 )
             else:
-                first = block[0::2, :]
-                second = block[1::2, :]
-                a = first[np.ix_(sample_group.offsets, variant_group.offsets)]
-                b = second[np.ix_(sample_group.offsets, variant_group.offsets)]
+                a = _take(block[0::2, :], sample_sel, variant_sel)
+                b = _take(block[1::2, :], sample_sel, variant_sel)
                 values = _format_haplotype_pair_values(
                     a,
                     b,
@@ -1064,7 +1137,14 @@ class HapStore:
             read_sec += float(tile_read_sec)
             convert_sec += float(tile_convert_sec)
             assign_start = time.perf_counter()
-            out[np.ix_(out_rows, out_cols)] = values
+            row_sel = _index_selector(out_rows)
+            if output == "haplotypes":
+                row_sel = (
+                    slice(2 * row_sel.start, 2 * row_sel.stop)
+                    if isinstance(row_sel, slice)
+                    else _haplotype_rows(out_rows)
+                )
+            _assign(out, row_sel, _index_selector(out_cols), values)
             assign_sec += time.perf_counter() - assign_start
 
         max_in_flight_tiles = 1
@@ -1096,6 +1176,7 @@ class HapStore:
         self._last_read_metrics = {
             "backend": "threaded",
             "dataset": arr_name,
+            "output": output,
             "requested_workers": str(workers),
             "workers": int(worker_count),
             **worker_policy,
@@ -1218,6 +1299,72 @@ class HapStore:
             "genetic_pos": genetic,
         }
 
+    def read_haplotypes(
+        self,
+        chrom: str | int,
+        *,
+        variant_ids: Sequence[str] | None = None,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        workers: int | str = "auto",
+        backend: str = "auto",
+    ) -> np.ndarray:
+        """Read phased haplotypes for selected samples and variants.
+
+        Exactly one of ``variant_ids`` or ``variant_indices`` must be provided.
+        Requested sample and variant order is preserved, including duplicates.
+        Uses the same threaded, chunk-coalesced tile reader as
+        ``read_dosages()``: sample subsets read whole chunk spans and select
+        rows in memory instead of per-row fancy indexing.
+
+        Args:
+            chrom: Chromosome label.
+            variant_ids: Variant identifiers to read.
+            variant_indices: Zero-based variant indices to read.
+            sample_indices: Zero-based sample indices or a boolean sample mask.
+                When omitted, all samples are read.
+            workers: Positive thread count or ``"auto"``. Setting this to ``1``
+                forces serial execution.
+            backend: Reading backend: ``"auto"``, ``"threaded"``, or ``"serial"``.
+
+        Returns:
+            A ``uint8`` array of shape ``(2 * n_samples, n_variants)``; rows
+            ``2i`` and ``2i + 1`` are requested sample ``i``. Missing alleles
+            keep the stored sentinel value.
+        """
+        chrom_group = self._require_chromosome(chrom)
+        variant_idx = self._resolve_variant_indices(
+            chrom=chrom,
+            variant_ids=variant_ids,
+            variant_indices=variant_indices,
+        )
+        sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
+        if variant_idx.size == 0 or sample_idx.size == 0:
+            return np.empty((2 * sample_idx.size, variant_idx.size), dtype=np.uint8)
+        backend_name = str(backend).lower()
+        if backend_name not in {"auto", "threaded", "serial"}:
+            raise ValueError(f"backend must be one of auto/threaded/serial, got {backend!r}")
+        if backend_name == "serial" or _is_explicit_single_worker(workers):
+            return self._read_block_values(
+                chrom_group=chrom_group,
+                chrom=chrom,
+                data="haplotypes",
+                variant_indices=variant_idx,
+                sample_indices=sample_idx,
+                dtype=np.dtype("uint8"),
+            )
+        return self._read_tiles(
+            chrom,
+            variant_idx=variant_idx,
+            sample_idx=sample_idx,
+            output="haplotypes",
+            target_dtype=np.dtype("uint8"),
+            missing_mode="sentinel",
+            has_missing=False,
+            assume_no_missing=True,
+            workers=workers,
+        )
+
     def read_dosage_batch(
         self,
         chrom: str | int,
@@ -1269,8 +1416,8 @@ class HapStore:
                 ``missing="nan"``.
         """
 
-        request_specs = [self._parse_dosage_request(request, i) for i, request in enumerate(requests)]
-        if not request_specs:
+        planned = self._plan_request_union(chrom, requests)
+        if planned is None:
             sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
             return HapStoreDosageBatch(
                 matrix=np.empty((sample_idx.size, 0), dtype=np.dtype(dtype)),
@@ -1279,6 +1426,119 @@ class HapStore:
                 request_ids=(),
                 metrics={"backend": "empty"},
             )
+        parsed, union_indices_arr, request_columns = planned
+        matrix = self.read_dosages(
+            chrom,
+            variant_indices=union_indices_arr,
+            sample_indices=sample_indices,
+            dtype=dtype,
+            missing=missing,
+            workers=workers,
+            backend=backend,
+            assume_no_missing=assume_no_missing,
+        )
+        metadata = self._read_variant_metadata_block(
+            chrom_group=self._require_chromosome(chrom),
+            variant_indices=union_indices_arr,
+        )
+        chrom_alias = self._chrom_key(chrom).removeprefix("chr")
+        union_variant_ids = tuple(
+            str(vid) if str(vid) else f"{chrom_alias}:{int(pos)}"
+            for vid, pos in zip(metadata["vid"], metadata["positions"])
+        )
+        return HapStoreDosageBatch(
+            matrix=matrix,
+            variant_indices=union_indices_arr,
+            request_columns=request_columns,
+            request_ids=tuple(request_id for request_id, _indices, _ids in parsed),
+            variant_ids=union_variant_ids,
+            metrics=self.last_read_metrics,
+            positions=metadata['positions'],
+            ref=metadata['ref'],
+            alt=metadata['alt'],
+        )
+
+    def read_haplotype_batch(
+        self,
+        chrom: str | int,
+        requests: Sequence[HapStoreDosageRequest | dict[str, Any] | tuple[Hashable, Sequence[str] | Sequence[int] | np.ndarray]],
+        *,
+        sample_indices: Sequence[int] | np.ndarray | None = None,
+        workers: int | str = "auto",
+        backend: str = "auto",
+    ) -> HapStoreHaplotypeBatch:
+        """Read haplotypes for multiple requests in one call.
+
+        Requests use the same forms as ``read_dosage_batch()``. Variants shared
+        between requests (for example, overlapping windows) are read once into a
+        sorted union matrix; ``window_matrix()`` returns one request's columns
+        in its original order.
+
+        Args:
+            chrom: Chromosome label.
+            requests: A sequence of variant requests.
+            sample_indices: Zero-based sample indices or a boolean sample mask.
+                When omitted, all samples are read.
+            workers: Positive thread count or ``"auto"``.
+            backend: Reading backend: ``"auto"``, ``"threaded"``, or ``"serial"``.
+
+        Returns:
+            A batch with the ``uint8`` union haplotype matrix, sorted variant
+            indices, request-to-column mappings, selected variant metadata and
+            read metrics.
+        """
+        planned = self._plan_request_union(chrom, requests)
+        if planned is None:
+            sample_idx = self._resolve_sample_indices(chrom=chrom, sample_indices=sample_indices)
+            return HapStoreHaplotypeBatch(
+                matrix=np.empty((2 * sample_idx.size, 0), dtype=np.uint8),
+                variant_indices=np.empty(0, dtype=np.int64),
+                request_columns={},
+                request_ids=(),
+                metrics={"backend": "empty"},
+            )
+        parsed, union_indices_arr, request_columns = planned
+        matrix = self.read_haplotypes(
+            chrom,
+            variant_indices=union_indices_arr,
+            sample_indices=sample_indices,
+            workers=workers,
+            backend=backend,
+        )
+        metadata = self._read_variant_metadata_block(
+            chrom_group=self._require_chromosome(chrom),
+            variant_indices=union_indices_arr,
+        )
+        chrom_alias = self._chrom_key(chrom).removeprefix("chr")
+        return HapStoreHaplotypeBatch(
+            matrix=matrix,
+            variant_indices=union_indices_arr,
+            request_columns=request_columns,
+            request_ids=tuple(request_id for request_id, _indices, _ids in parsed),
+            variant_ids=tuple(
+                str(vid) if str(vid) else f"{chrom_alias}:{int(pos)}"
+                for vid, pos in zip(metadata["vid"], metadata["positions"])
+            ),
+            metrics=self.last_read_metrics,
+            positions=metadata["positions"],
+            ref=metadata["ref"],
+            alt=metadata["alt"],
+        )
+
+    def _plan_request_union(
+        self,
+        chrom: str | int,
+        requests: Sequence[Any],
+    ) -> tuple[list[tuple[Hashable, np.ndarray, tuple[str, ...] | None]], np.ndarray, dict[Hashable, np.ndarray]] | None:
+        """Resolve batch requests to a sorted union of variant indices.
+
+        Returns ``None`` for an empty request list; otherwise the parsed
+        requests, the sorted unique union indices and each request's columns
+        in that union. Request IDs must be unique and hashable.
+        """
+        request_specs = [self._parse_dosage_request(request, i) for i, request in enumerate(requests)]
+        if not request_specs:
+            return None
         seen_request_ids: set[Hashable] = set()
         for request_id, _variant_ids, _variant_indices in request_specs:
             try:
@@ -1320,36 +1580,7 @@ class HapStore:
             request_id: np.asarray([union_pos[int(idx)] for idx in indices], dtype=np.int64)
             for request_id, indices, _ids in parsed
         }
-        matrix = self.read_dosages(
-            chrom,
-            variant_indices=union_indices_arr,
-            sample_indices=sample_indices,
-            dtype=dtype,
-            missing=missing,
-            workers=workers,
-            backend=backend,
-            assume_no_missing=assume_no_missing,
-        )
-        metadata = self._read_variant_metadata_block(
-            chrom_group=self._require_chromosome(chrom),
-            variant_indices=union_indices_arr,
-        )
-        chrom_alias = self._chrom_key(chrom).removeprefix("chr")
-        union_variant_ids = tuple(
-            str(vid) if str(vid) else f"{chrom_alias}:{int(pos)}"
-            for vid, pos in zip(metadata["vid"], metadata["positions"])
-        )
-        return HapStoreDosageBatch(
-            matrix=matrix,
-            variant_indices=union_indices_arr,
-            request_columns=request_columns,
-            request_ids=tuple(request_id for request_id, _indices, _ids in parsed),
-            variant_ids=union_variant_ids,
-            metrics=self.last_read_metrics,
-            positions=metadata['positions'],
-            ref=metadata['ref'],
-            alt=metadata['alt'],
-        )
+        return parsed, union_indices_arr, request_columns
 
     def variant_positions(self, chrom: str | int) -> np.ndarray:
         """Return one-based physical positions in variant-row order."""
@@ -2186,6 +2417,41 @@ def _available_read_memory_bytes(cpu_count: int) -> tuple[int | None, str]:
         return None, "unavailable"
     source, value = min(candidates, key=lambda item: item[1])
     return int(value), str(source)
+
+
+def _index_selector(indices: np.ndarray) -> slice | np.ndarray:
+    """Return a slice for strictly consecutive increasing indices, else the indices."""
+    idx = np.asarray(indices, dtype=np.int64)
+    if idx.size == 0:
+        return idx
+    first = int(idx[0])
+    if int(idx[-1]) - first + 1 == idx.size and (idx.size == 1 or bool(np.all(np.diff(idx) == 1))):
+        return slice(first, first + int(idx.size))
+    return idx
+
+
+def _haplotype_rows(sample_positions: np.ndarray) -> np.ndarray:
+    """Interleaved haplotype row indices (2i, 2i + 1) for sample positions i."""
+    pos = np.asarray(sample_positions, dtype=np.int64)
+    rows = np.empty(2 * pos.size, dtype=np.int64)
+    rows[0::2] = 2 * pos
+    rows[1::2] = 2 * pos + 1
+    return rows
+
+
+def _take(block: np.ndarray, rows: slice | np.ndarray, cols: slice | np.ndarray) -> np.ndarray:
+    """Select rows and columns, using views when both selectors are slices."""
+    if isinstance(rows, slice) or isinstance(cols, slice):
+        return block[rows, cols]
+    return block[np.ix_(rows, cols)]
+
+
+def _assign(out: np.ndarray, rows: slice | np.ndarray, cols: slice | np.ndarray, values: np.ndarray) -> None:
+    """Write a tile into ``out`` with slice assignment where possible."""
+    if isinstance(rows, slice) or isinstance(cols, slice):
+        out[rows, cols] = values
+    else:
+        out[np.ix_(rows, cols)] = values
 
 
 def _make_read_groups(indices: np.ndarray, *, chunk_size: int, limit: int) -> list[_ReadGroup]:

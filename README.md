@@ -189,6 +189,22 @@ allele arrays.
 
 `read_dosages` groups requested variants and sample rows by native zarr chunks, coalesces adjacent dense chunks into larger production-oriented tiles, opens one read handle per worker, reads 2D row-by-variant tiles concurrently, and returns columns in request order. If a stored `genotypes` array exists, it reads that array directly; otherwise it sums paired haplotypes tile-by-tile. Stores with `has_missing=false` skip missing-sentinel scans by default. `workers="auto"` uses a chunk-grid-aware policy capped at 16 workers by default, then respects process CPU affinity, `SLURM_CPUS_PER_TASK`, and a memory cap derived from the coalesced input/output tile size. Threaded reads keep at most one in-flight tile per resolved worker and assign completed tiles immediately. Set `HAPSTORE_READ_AUTO_MAX_WORKERS` to lower the auto cap or `HAPSTORE_READ_WORKERS` to force a worker count for benchmarking. Contiguous-batch tile coalescing defaults to `4` variant chunks by `2` sample chunks; tune with `HAPSTORE_READ_VARIANT_GROUP_CHUNKS`, `HAPSTORE_READ_SAMPLE_GROUP_CHUNKS`, and `HAPSTORE_READ_COALESCE_MIN_DENSITY`. Use `workers=1` or `backend="serial"` to opt out of threaded tile reads.
 
+Phased haplotypes use the same tile reader. `read_haplotypes` returns a `uint8` `(2 * n_samples, n_variants)` matrix in requested sample order (rows `2i` and `2i + 1` are sample `i`; missing alleles keep the stored sentinel), and `read_haplotype_batch` reads overlapping windows once into a union matrix:
+
+```python
+haps = store.read_haplotypes("1", variant_indices=range(1000, 1200), sample_indices=train_idx, workers=8)
+
+batch = store.read_haplotype_batch(
+    "1",
+    [("w1", range(1000, 1200)), ("w2", range(1100, 1300))],
+    sample_indices=train_idx,
+    workers=8,
+)
+w1_haps = batch.window_matrix("w1")
+```
+
+Tiles whose sample and variant selections are consecutive runs are copied with slices rather than fancy indexing, which keeps all-sample and contiguous-window reads close to raw decompression speed.
+
 For chunk-aligned scans, `iter_blocks(chrom, data="genotypes")` yields `HapStoreBlock` objects with `values`, `variant_indices`, `positions`, `ref`, `alt`, `vid`, `start`, and `stop`. Default blocks follow the on-disk variant chunk size. Explicit `variant_indices`, `sample_indices`, or `sample_mask` requests preserve caller order within each yielded block.
 
 `variant_maf(...)` computes alternate-allele frequency, MAF, alternate-allele counts, and called genotype/allele counts with missing genotypes excluded from denominators. It supports the same sample and variant subset arguments as `iter_blocks`; `non_monomorphic_variant_indices(...)` returns the ordered subset with MAF above a threshold.

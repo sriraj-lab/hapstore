@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import zarr
 
-from hapstore import HapStore, HapStoreDosageRequest
+from hapstore import HapStore, HapStoreDosageRequest, HapStoreHaplotypeBatch
 from hapstore import store as store_module
 
 
@@ -771,3 +771,112 @@ def test_cross_chrom_sample_consistency_check(tmp_path, synthetic_arrays):
     bad["sample_ids"] = np.asarray(["x1", "x2"], dtype=object)
     with pytest.raises(ValueError, match="sample ID ordering mismatch"):
         store.create_chromosome(chrom="2", **bad)
+
+
+def _random_haplotype_store(tmp_path, *, n_samples=37, n_variants=23, store_genotypes=False, missing=False):
+    rng = np.random.default_rng(7)
+    haps = rng.integers(0, 2, size=(2 * n_samples, n_variants), dtype=np.uint8)
+    if missing:
+        haps[5, 3] = 255
+    store = HapStore(tmp_path / "haps.zarr", mode="w")
+    store.create_chromosome(
+        chrom="1",
+        haplotypes=haps,
+        variant_pos=np.arange(1, n_variants + 1, dtype=np.int64) * 100,
+        sample_ids=np.asarray([f"s{i}" for i in range(n_samples)], dtype=object),
+        ref=np.asarray(["A"] * n_variants, dtype=object),
+        alt=np.asarray(["G"] * n_variants, dtype=object),
+        vid=np.asarray([f"v{i}" for i in range(n_variants)], dtype=object),
+        chunk_variant_size=4,
+        chunk_haplotype_size=6,
+        store_genotypes=store_genotypes,
+    )
+    return store, haps
+
+
+def _expected_haplotypes(haps, samples, variants):
+    rows = np.empty(2 * len(samples), dtype=np.int64)
+    rows[0::2] = 2 * np.asarray(samples)
+    rows[1::2] = 2 * np.asarray(samples) + 1
+    return haps[np.ix_(rows, np.asarray(variants))]
+
+
+@pytest.mark.parametrize("store_genotypes", [False, True])
+@pytest.mark.parametrize("workers", [1, 4])
+def test_read_haplotypes_preserves_sample_and_variant_order(tmp_path, store_genotypes, workers):
+    store, haps = _random_haplotype_store(tmp_path, store_genotypes=store_genotypes)
+    samples = [30, 2, 2, 17, 0, 36]
+    variants = [22, 3, 4, 3, 0, 11]
+    got = store.read_haplotypes("1", variant_indices=variants, sample_indices=samples, workers=workers)
+    assert got.dtype == np.uint8
+    np.testing.assert_array_equal(got, _expected_haplotypes(haps, samples, variants))
+
+
+def test_read_haplotypes_mask_matches_legacy_reader_and_all_samples(tmp_path):
+    store, haps = _random_haplotype_store(tmp_path)
+    mask = np.zeros(37, dtype=bool)
+    mask[::2] = True  # exactly half the samples: the legacy reader's fancy-indexing path
+    span = (5, 19)
+    legacy = store.haplotypes("1", variant_slice=span, sample_mask=mask)
+    threaded = store.read_haplotypes("1", variant_indices=np.arange(*span), sample_indices=mask, workers=4)
+    np.testing.assert_array_equal(threaded, legacy)
+    np.testing.assert_array_equal(store.read_haplotypes("1", variant_ids=["v0", "v22"], workers=4), haps[:, [0, 22]])
+    assert store.last_read_metrics["output"] == "haplotypes"
+    assert store.last_read_metrics["n_tiles"] > 1
+
+
+def test_read_haplotypes_keeps_missing_sentinel(tmp_path):
+    store, haps = _random_haplotype_store(tmp_path, missing=True)
+    for workers in (1, 4):
+        got = store.read_haplotypes("1", variant_indices=[3], sample_indices=[2], workers=workers)
+        np.testing.assert_array_equal(got[:, 0], haps[[4, 5], 3])
+        assert got[1, 0] == 255
+
+
+def test_read_haplotype_batch_reads_overlapping_windows_once(tmp_path):
+    store, haps = _random_haplotype_store(tmp_path)
+    windows = [("w0", list(range(0, 10))), ("w1", list(range(5, 15))), ("w2", [20, 18, 18])]
+    batch = store.read_haplotype_batch("1", windows, sample_indices=[4, 1, 9], workers=4)
+    assert isinstance(batch, HapStoreHaplotypeBatch)
+    np.testing.assert_array_equal(batch.variant_indices, np.r_[np.arange(15), 18, 20])
+    assert batch.matrix.shape == (6, 17) and batch.request_ids == ("w0", "w1", "w2")
+    for request_id, variants in windows:
+        np.testing.assert_array_equal(batch.window_matrix(request_id), _expected_haplotypes(haps, [4, 1, 9], variants))
+    assert batch.variant_ids[:2] == ("v0", "v1")
+    np.testing.assert_array_equal(batch.positions[:2], [100, 200])
+    empty = store.read_haplotype_batch("1", [], sample_indices=[0, 1])
+    assert empty.matrix.shape == (4, 0)
+
+
+def test_read_dosage_batch_unchanged_by_shared_union_planner(tmp_path):
+    store, haps = _random_haplotype_store(tmp_path)
+    batch = store.read_dosage_batch("1", [("a", [7, 2]), ("b", [2, 9])], sample_indices=[3, 0], workers=4)
+    dos = (haps[0::2] + haps[1::2]).astype(np.float32)
+    np.testing.assert_array_equal(batch.window_matrix("a"), dos[np.ix_([3, 0], [7, 2])])
+    np.testing.assert_array_equal(batch.variant_indices, [2, 7, 9])
+
+
+@pytest.mark.parametrize(
+    "samples, variants",
+    [
+        (np.arange(37), np.arange(23)),  # every tile is a slice on both axes
+        (np.arange(5, 30), np.r_[2:9, 15:21]),  # contiguous rows, gapped columns
+        (np.r_[0:10, 20:30], np.arange(4, 19)),  # gapped rows, contiguous columns
+    ],
+)
+def test_slice_fast_path_matches_direct_selection(tmp_path, samples, variants):
+    store, haps = _random_haplotype_store(tmp_path, store_genotypes=False)
+    got = store.read_haplotypes("1", variant_indices=variants, sample_indices=samples, workers=4)
+    np.testing.assert_array_equal(got, _expected_haplotypes(haps, samples, variants))
+    assert store.last_read_metrics["n_tiles"] > 1
+    dos = store.read_dosages("1", variant_indices=variants, sample_indices=samples, workers=4)
+    serial = store.read_dosages("1", variant_indices=variants, sample_indices=samples, workers=1)
+    np.testing.assert_array_equal(dos, serial)
+    np.testing.assert_array_equal(dos, (haps[0::2] + haps[1::2])[np.ix_(samples, variants)])
+
+
+def test_index_selector_and_haplotype_rows():
+    assert store_module._index_selector(np.asarray([3, 4, 5])) == slice(3, 6)
+    assert isinstance(store_module._index_selector(np.asarray([3, 5])), np.ndarray)
+    assert isinstance(store_module._index_selector(np.asarray([4, 3])), np.ndarray)
+    np.testing.assert_array_equal(store_module._haplotype_rows(np.asarray([2, 0])), [4, 5, 0, 1])
