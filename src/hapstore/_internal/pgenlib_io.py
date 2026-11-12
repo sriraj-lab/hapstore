@@ -27,11 +27,12 @@ def ensure_pgenlib_available() -> None:
 
 
 class PgenlibWriter:
-    """Write phased, biallelic hardcalls to a PGEN payload.
+    """Write biallelic hardcalls to a PGEN payload.
 
     This adapter writes only the ``.pgen`` file; ``hapstore.pgen`` owns the
     aligned PVAR and PSAM files. The sample and variant counts are fixed when
-    the writer opens, and every appended batch is marked as phased.
+    the writer opens. Every appended batch is marked phased, or unphased when
+    ``phased=False`` (for stores whose allele order is arbitrary).
 
     Args:
         pgen_path: Output path for the PGEN payload.
@@ -39,7 +40,9 @@ class PgenlibWriter:
         variant_ct: Total number of variants that will be appended.
     """
 
-    def __init__(self, pgen_path: str | Path, sample_ct: int, variant_ct: int) -> None:
+    def __init__(
+        self, pgen_path: str | Path, sample_ct: int, variant_ct: int, phased: bool = True
+    ) -> None:
         ensure_pgenlib_available()
         if int(sample_ct) <= 0:
             raise ValueError(f"sample_ct must be > 0, got {sample_ct}")
@@ -53,8 +56,9 @@ class PgenlibWriter:
             variant_ct=int(variant_ct),
             nonref_flags=False,
             allele_ct_limit=2,
-            hardcall_phase_present=True,
+            hardcall_phase_present=bool(phased),
         )
+        self._phased = bool(phased)
 
     def append_alleles_batch(self, allele_batch: np.ndarray) -> None:
         """Append variant-major, interleaved diploid allele hardcalls.
@@ -75,7 +79,7 @@ class PgenlibWriter:
             arr = arr.astype(np.int32, copy=False)
         if not arr.flags["C_CONTIGUOUS"]:
             arr = np.ascontiguousarray(arr)
-        self._writer.append_alleles_batch(arr, all_phased=True)
+        self._writer.append_alleles_batch(arr, all_phased=self._phased)
 
     def close(self) -> None:
         self._writer.close()

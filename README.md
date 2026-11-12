@@ -145,7 +145,8 @@ export_pgen(
 - `concat_hapstores` is a concat operation, not a key-based merge.
 - Sample-axis concat performs complete variant-axis validation by default.
 - Variant-axis concat requires identical sample IDs and order across inputs; unsafe parallel layouts fall back to serial copy.
-- HapStore stores phased, biallelic hardcalls only. VCF ingest rejects multiallelic records and unphased heterozygotes by default; use `on_multiallelic="skip"` or `on_unphased_gt="missing"` only when that loss of information is intended.
+- HapStore stores biallelic hardcalls. VCF and PGEN ingest reject multiallelic records and unphased heterozygotes by default; use `on_multiallelic="skip"` or `on_unphased_gt="missing"` only when that loss of information is intended.
+- Unphased genotypes: `on_unphased_gt="arbitrary"` keeps unphased heterozygotes with arbitrary allele order, so dosages stay exact. The chromosome is then marked `phased: false` (`HapStore.is_phased()`), and VCF/PGEN export writes unphased calls. Check `is_phased()` before using individual haplotypes (haplotype PCA, local ancestry). `ingest_arrays(..., phased=False)` sets the flag for in-memory data, and `concat_hapstores` and sample subsetting carry it through.
 - `backend="auto"` prefers the PLINK2 bridge when available and otherwise uses the required `pysam` reader. `cyvcf2` is available through the `vcf-fast` extra and must be selected explicitly.
 - Parallel staged VCF ingest requires indexed input (`.tbi` or `.csi`).
 - PGEN ingest streams bounded variant blocks. Use `scratch_dir` to place parallel shard intermediates on fast local storage.

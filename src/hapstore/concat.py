@@ -52,6 +52,7 @@ class _InputChrom:
     haplotypes_arr: zarr.Array
     variants_group: zarr.Group
     has_missing: bool
+    phased: bool = True
 
 
 def _validate_and_collect_inputs(
@@ -117,6 +118,7 @@ def _validate_and_collect_inputs(
                 haplotypes_arr=haplotypes_arr,
                 variants_group=variants_group,
                 has_missing=bool(store.attrs(chrom_key).get("has_missing", False)),
+                phased=bool(store.attrs(chrom_key).get("phased", True)),
             )
         )
 
@@ -747,6 +749,7 @@ def _concat_samples_into_store(
             source=source_attr,
             build=build_attr,
             extra=attrs_payload or None,
+            phased=all(src.phased for src in sources),
         )
     )
 
@@ -938,6 +941,7 @@ def _concat_variants_into_store(
             source=source_attr,
             build=build_attr,
             extra=attrs_payload or None,
+            phased=all(src.phased for src in sources),
         )
     )
 

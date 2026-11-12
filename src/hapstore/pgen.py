@@ -51,7 +51,7 @@ from .concat import concat_hapstores
 from .store import HapStore, _MISSING_SENTINEL
 
 PartialMissingPolicy = Literal["error", "missing"]
-UnphasedPolicy = Literal["error", "missing"]
+UnphasedPolicy = Literal["error", "missing", "arbitrary"]
 
 
 def _read_pgen_haplotype_block(
@@ -69,9 +69,9 @@ def _read_pgen_haplotype_block(
     PGEN returns a variant-major matrix with each sample's two alleles in
     adjacent columns. This function converts it to the HapStore layout of
     ``(2 * samples, variants)``. Missing diploid pairs are encoded with
-    ``_MISSING_SENTINEL``. Unphased heterozygotes either raise or become
-    missing on both haplotypes; unphased homozygotes remain unambiguous.
-    ``hap_reorder`` restores the caller's requested sample order after pgenlib
+    ``_MISSING_SENTINEL``. Unphased heterozygotes raise, become missing on
+    both haplotypes, or are kept in file order (``"arbitrary"``); unphased
+    homozygotes remain unambiguous. ``hap_reorder`` restores the caller's requested sample order after pgenlib
     reads a sorted sample subset.
 
     Returns:
@@ -133,8 +133,10 @@ def _read_pgen_haplotype_block(
                 "unphased heterozygous genotype encountered while ingesting PGEN "
                 f"(variant={chrom_key}:{int(positions[int(first[0])])}, sample_index={int(first[1])})"
             )
-        a0[unphased_het] = -9
-        a1[unphased_het] = -9
+        if on_unphased_gt == "missing":
+            a0[unphased_het] = -9
+            a1[unphased_het] = -9
+        # "arbitrary": keep both alleles in file order; dosage is exact.
 
     pair_missing = (a0 < 0) | (a1 < 0)
     a0[pair_missing] = -9
@@ -598,6 +600,7 @@ def _export_pgen_single(
             pgen_path=pgen_path,
             sample_ct=len(sample_plan.selected_sample_ids),
             variant_ct=n_out_variants,
+            phased=store.is_phased(chrom_key),
         ) as writer:
             for variant_sel in slices:
                 start = int(variant_sel.start or 0)
@@ -689,8 +692,10 @@ def ingest_pgen(
             samples are ingested when omitted.
         variant_block_size: Number of variants per read/write block.
         on_unphased_gt: Handling for unphased heterozygous genotypes.
-            ``"error"`` rejects them and ``"missing"`` marks both haplotypes
-            missing. Unphased homozygotes are retained.
+            ``"error"`` rejects them, ``"missing"`` marks both haplotypes
+            missing, and ``"arbitrary"`` keeps both alleles in file order
+            and marks the chromosome ``phased=False`` when any are found
+            (dosages stay exact). Unphased homozygotes are retained.
         strict_biallelic: Must remain ``True``; non-biallelic ingestion is
             unsupported.
         workers: Number of contiguous variant-range workers.
@@ -722,10 +727,14 @@ def ingest_pgen(
     ensure_pgenlib_available()
     if int(variant_block_size) <= 0:
         raise ValueError(f"variant_block_size must be positive, got {variant_block_size}")
-    if on_unphased_gt not in {"error", "missing"}:
-        raise ValueError(f"on_unphased_gt must be 'error' or 'missing', got {on_unphased_gt!r}")
+    if on_unphased_gt not in {"error", "missing", "arbitrary"}:
+        raise ValueError(
+            f"on_unphased_gt must be 'error', 'missing' or 'arbitrary', got {on_unphased_gt!r}"
+        )
     if int(workers) <= 0:
         raise ValueError(f"workers must be >=1, got {workers}")
+    # Recorded so the chromosome's ``phased`` flag can be derived at finalize.
+    attrs = {**(attrs or {}), "on_unphased_gt": str(on_unphased_gt)}
 
     prefix = _normalize_pgen_prefix(pgen_prefix)
     pgen_path, pvar_path, psam_path = _pgen_paths(prefix)

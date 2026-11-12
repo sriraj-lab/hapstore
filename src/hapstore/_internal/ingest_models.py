@@ -12,7 +12,8 @@ from hapstore.store import _MISSING_SENTINEL
 Backend = Literal["auto", "cyvcf2", "pysam", "text", "plink2_bridge"]
 MissingRefAltPolicy = Literal["error", "dot"]
 MissingVidPolicy = Literal["dot", "error"]
-UnphasedPolicy = Literal["missing", "error"]
+UnphasedPolicy = Literal["missing", "error", "arbitrary"]
+UNPHASED_POLICIES = ("missing", "error", "arbitrary")
 MultiallelicPolicy = Literal["error", "skip"]
 
 

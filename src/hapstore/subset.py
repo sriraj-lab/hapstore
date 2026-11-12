@@ -253,6 +253,7 @@ def subset_samples_to_new_store(
             source=src_attrs.get("source"),
             build=src_attrs.get("build"),
             extra=extra_payload or None,
+            phased=bool(src_attrs.get("phased", True)),
         )
     )
 

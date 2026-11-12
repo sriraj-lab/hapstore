@@ -282,10 +282,11 @@ class HapStore:
         chunk_sample_size: int | None = None,
         compression_level: int = 3,
         attrs: dict | None = None,
+        phased: bool = True,
     ) -> None:
         """Create and populate one chromosome group in the store.
 
-        Haplotypes must use the phased diploid layout ``(2N, V)``: rows
+        Haplotypes must use the diploid layout ``(2N, V)``: rows
         ``2*i`` and ``2*i + 1`` are the two haplotypes for sample ``i``, and
         columns follow the order of the variant metadata arrays. Values are
         restricted to reference allele ``0``, alternate allele ``1``, and the
@@ -328,6 +329,10 @@ class HapStore:
                 byte-targeted size.
             compression_level: Non-negative Zstandard compression level used
                 for chromosome arrays.
+            phased: Whether row order within each sample is true phase.
+                Pass ``False`` for unphased genotypes stored with arbitrary
+                allele order; dosage reads are unaffected, and
+                ``is_phased()`` reports the flag to haplotype-level callers.
             attrs: Optional provenance metadata. ``source`` and ``build`` are
                 promoted to chromosome attributes; remaining entries are
                 stored under the ``extra`` attribute. Format, shape, missing,
@@ -590,6 +595,7 @@ class HapStore:
                     source=source,
                     build=build,
                     extra=attrs_payload or None,
+                    phased=bool(phased),
                 )
             )
         except Exception:
@@ -1903,6 +1909,17 @@ class HapStore:
         """Return a copy of the chromosome-group attributes."""
         chrom_group = self._require_chromosome(chrom)
         return dict(chrom_group.attrs.asdict())
+
+    def is_phased(self, chrom: str | int) -> bool:
+        """Return whether haplotype row order is true phase for ``chrom``.
+
+        ``False`` means unphased heterozygotes were stored with arbitrary
+        allele order. Dosage reads are exact either way; callers that use
+        individual haplotypes (haplotype PCA, local ancestry, phased export)
+        should check this first. Stores written before the flag existed
+        report ``True``.
+        """
+        return bool(self.attrs(chrom).get("phased", True))
 
     def has_chromosome(self, chrom: str | int) -> bool:
         """Return whether the normalized chromosome group exists."""

@@ -688,8 +688,11 @@ def ingest_vcf(
         attrs: Optional caller-supplied chromosome provenance metadata.
         on_missing_ref_alt: Reject missing REF/ALT or replace them with dots.
         on_missing_vid: Replace missing IDs with dots or reject them.
-        on_unphased_gt: Reject unphased heterozygotes or mark both alleles
-            missing. Unphased homozygotes remain unambiguous.
+        on_unphased_gt: Reject unphased heterozygotes (``"error"``), mark
+            both alleles missing (``"missing"``), or keep both alleles in
+            file order (``"arbitrary"``). With ``"arbitrary"`` the chromosome
+            is marked ``phased=False`` when any are found; dosages stay
+            exact. Unphased homozygotes remain unambiguous.
         on_multiallelic: Reject or skip multiallelic records.
         workers: Positive number of reader workers. Values greater than one
             use staged ingestion for pysam and cyvcf2.
@@ -715,8 +718,10 @@ def ingest_vcf(
         raise ValueError(f"on_missing_ref_alt must be 'error' or 'dot', got {on_missing_ref_alt!r}")
     if on_missing_vid not in {"dot", "error"}:
         raise ValueError(f"on_missing_vid must be 'dot' or 'error', got {on_missing_vid!r}")
-    if on_unphased_gt not in {"missing", "error"}:
-        raise ValueError(f"on_unphased_gt must be 'missing' or 'error', got {on_unphased_gt!r}")
+    if on_unphased_gt not in {"missing", "error", "arbitrary"}:
+        raise ValueError(
+            f"on_unphased_gt must be 'missing', 'error' or 'arbitrary', got {on_unphased_gt!r}"
+        )
     if on_multiallelic not in {"error", "skip"}:
         raise ValueError(
             f"on_multiallelic must be 'error' or 'skip', got {on_multiallelic!r}"
@@ -908,6 +913,7 @@ def ingest_arrays(
     chunk_sample_size: int | None = None,
     compression_level: int = 3,
     attrs: dict | None = None,
+    phased: bool = True,
 ) -> HapStore:
     """Ingest in-memory arrays into a HapStore.
 
@@ -928,6 +934,8 @@ def ingest_arrays(
         chunk_sample_size: Optional genotype sample rows per Zarr chunk.
         compression_level: Non-negative Zstandard compression level.
         attrs: Optional caller-supplied chromosome provenance metadata.
+        phased: Whether row order within each sample is true phase. Pass
+            ``False`` for unphased genotypes in arbitrary allele order.
 
     Returns:
         The completed HapStore opened at ``output_zarr``.
@@ -960,6 +968,7 @@ def ingest_arrays(
             chunk_sample_size=chunk_sample_size,
             compression_level=compression_level,
             attrs=attrs,
+            phased=bool(phased),
         )
         return store
     except Exception:
@@ -1492,7 +1501,9 @@ def _read_cyvcf2_shard_worker(
                     f"{chrom_name}:{pos} sample={subset_samples[bad]}"
                 )
 
-        missing = (a0 < 0) | (a1 < 0) | unphased_het
+        missing = (a0 < 0) | (a1 < 0)
+        if on_unphased_gt == "missing":
+            missing |= unphased_het
         col[0::2] = np.where(missing, _MISSING_SENTINEL, (a0 > 0).astype(np.uint8))
         col[1::2] = np.where(missing, _MISSING_SENTINEL, (a1 > 0).astype(np.uint8))
         positions.append(pos)
@@ -1608,9 +1619,10 @@ def _read_pysam_shard_worker(
                         "unphased genotype is heterozygous at "
                         f"{chrom_name}:{pos} sample={sample_name}"
                     )
-                hap[2 * out_i] = _MISSING_SENTINEL
-                hap[2 * out_i + 1] = _MISSING_SENTINEL
-                continue
+                if on_unphased_gt == "missing":
+                    hap[2 * out_i] = _MISSING_SENTINEL
+                    hap[2 * out_i + 1] = _MISSING_SENTINEL
+                    continue
 
             hap[2 * out_i] = 1 if int(a0) > 0 else 0
             hap[2 * out_i + 1] = 1 if int(a1) > 0 else 0

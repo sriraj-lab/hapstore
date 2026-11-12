@@ -272,9 +272,10 @@ def _extract_vcf_arrays_cyvcf2(
                                 "unphased genotype is heterozygous at "
                                 f"{chrom_name}:{pos} sample_index={int(sample_i)}"
                             )
-                        hap[2 * out_i] = _MISSING_SENTINEL
-                        hap[2 * out_i + 1] = _MISSING_SENTINEL
-                        continue
+                        if on_unphased_gt == "missing":
+                            hap[2 * out_i] = _MISSING_SENTINEL
+                            hap[2 * out_i + 1] = _MISSING_SENTINEL
+                            continue
 
                     hap[2 * out_i] = 1 if int(a0) > 0 else 0
                     hap[2 * out_i + 1] = 1 if int(a1) > 0 else 0
@@ -377,9 +378,10 @@ def _extract_vcf_arrays_pysam(
                             "unphased genotype is heterozygous at "
                             f"{chrom_name}:{pos} sample={sample_name}"
                         )
-                    hap[2 * out_i] = _MISSING_SENTINEL
-                    hap[2 * out_i + 1] = _MISSING_SENTINEL
-                    continue
+                    if on_unphased_gt == "missing":
+                        hap[2 * out_i] = _MISSING_SENTINEL
+                        hap[2 * out_i + 1] = _MISSING_SENTINEL
+                        continue
 
                 hap[2 * out_i] = 1 if int(a0) > 0 else 0
                 hap[2 * out_i + 1] = 1 if int(a1) > 0 else 0
@@ -502,9 +504,10 @@ def _extract_vcf_arrays_text(
                             "unphased genotype is heterozygous at "
                             f"{contig}:{pos} sample={sample_name}"
                         )
-                    hap[2 * out_i] = _MISSING_SENTINEL
-                    hap[2 * out_i + 1] = _MISSING_SENTINEL
-                    continue
+                    if on_unphased_gt == "missing":
+                        hap[2 * out_i] = _MISSING_SENTINEL
+                        hap[2 * out_i + 1] = _MISSING_SENTINEL
+                        continue
 
                 hap[2 * out_i] = 1 if int(a0) > 0 else 0
                 hap[2 * out_i + 1] = 1 if int(a1) > 0 else 0

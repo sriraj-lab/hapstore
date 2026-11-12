@@ -184,6 +184,7 @@ def export_vcf(
 
     n_samples = len(sample_plan.selected_sample_ids)
     expected_haplotypes = 2 * n_samples
+    phased = store.is_phased(chrom_key)
 
     with pysam.VariantFile(str(plain_path), "w", header=header) as out:
         for variant_sel in slices:
@@ -231,6 +232,7 @@ def export_vcf(
                 alt=alt,
                 vid=vid,
                 strict_variant_info=strict_variant_info,
+                phased=phased,
             )
 
     if not bgzip:
@@ -378,8 +380,13 @@ def _write_vcf_records_to_open_file(
     alt: list[str],
     vid: list[str],
     strict_variant_info: bool,
+    phased: bool = True,
 ) -> None:
-    """Write phased GT-only VCF records to an open :class:`pysam.VariantFile`."""
+    """Write GT-only VCF records to an open :class:`pysam.VariantFile`.
+
+    Genotypes are written phased (``0|1``), or unphased (``0/1``) when
+    ``phased`` is false because the store's allele order is arbitrary.
+    """
     n_samples = len(sample_ids)
     if haplotypes.shape[0] != 2 * n_samples:
         raise ValueError(
@@ -411,10 +418,11 @@ def _write_vcf_records_to_open_file(
             a1 = int(haplotypes[2 * i + 1, j])
             if a0 == _MISSING_SENTINEL or a1 == _MISSING_SENTINEL:
                 record.samples[sid]["GT"] = (None, None)
-                record.samples[sid].phased = True
-            else:
+            elif phased:
                 record.samples[sid]["GT"] = (a0, a1)
-                record.samples[sid].phased = True
+            else:
+                record.samples[sid]["GT"] = (min(a0, a1), max(a0, a1))
+            record.samples[sid].phased = bool(phased)
 
         out.write(record)
 
